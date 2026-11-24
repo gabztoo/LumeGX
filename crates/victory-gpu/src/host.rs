@@ -1588,6 +1588,11 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let comparison = crate::capture::compare::config();
+        // Consume this present's selection even when the presenter cannot show it.
+        #[cfg(feature = "diagnostics")]
+        let selected = comparison.and_then(crate::capture::compare::Selection::take);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1629,41 +1634,72 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            #[cfg(feature = "diagnostics")]
+            let (source, selection) =
+                crate::capture::compare::source(selected.as_deref(), texture, &back);
+            #[cfg(not(feature = "diagnostics"))]
+            let source = texture;
+            let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+            let present = D3D12_RESOURCE_STATE_PRESENT;
+            // For a different source, the submission prelude transitions from
+            // the actual state (which another submission may still change).
+            #[cfg(feature = "diagnostics")]
+            let use_prelude = source != texture;
+            #[cfg(not(feature = "diagnostics"))]
+            let use_prelude = false;
+            #[cfg(feature = "diagnostics")]
+            if use_prelude && let Some(target) = selected.as_ref() {
+                p.copy.states.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    std::sync::Arc::as_ptr(target) as usize,
+                    (src.0 as u32, src.0 as u32, target.clone()),
+                );
+            }
+            if !use_prelude && state != src {
+                list.ResourceBarrier(&[transition(source, state, src)]);
+            }
+            list.ResourceBarrier(&[transition(&back, present, dest)]);
+            #[cfg(not(feature = "diagnostics"))]
+            list.CopyResource(&back, source);
+            #[cfg(feature = "diagnostics")]
+            let back_probe = crate::capture::compare::copy_to_back(
+                &self.device, list, source, &back, comparison.is_some(),
+            );
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, source))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, source);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            if !use_prelude && state != src {
+                list.ResourceBarrier(&[transition(source, src, state)]);
+            }
+            list.ResourceBarrier(&[transition(&back, dest, present)]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            if use_prelude {
+                p.copy.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _result = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            {
+                let level = if comparison.is_some() {
+                    crate::capture::compare::report(
+                        frame, index, selection, _result, probe.as_ref(), back_probe.as_ref(),
+                    )
+                } else {
+                    probe.as_ref().and_then(crate::capture::probe_level)
+                };
+                return Some(level.is_some_and(crate::capture::record_level));
+            }
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
