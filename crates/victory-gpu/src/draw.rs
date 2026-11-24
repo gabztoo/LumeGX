@@ -518,11 +518,22 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _ran = self.run_dispatch(list, x, y, z);
+        // Traced once its tables are bound: compute writes through them.
+        #[cfg(feature = "diagnostics")]
+        self.trace(
+            || format!("dispatch {x}x{y}x{z}{}", if _ran { "" } else { " DROPPED" }),
+            true,
+        );
+    }
+
+    /// Runs a dispatch on the host; false if it was dropped.
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -532,21 +543,22 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -590,7 +602,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        self.trace(|| format!("mesh {x} from 0"), false);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -768,29 +780,43 @@ impl State {
         made
     }
 
-    /// The first draws, at debug level: what they bind and read
-    /// (diagnostics builds).
+    /// The first draws and dispatches, and all of those of the frames
+    /// listed in `VICTORY_CAPTURE_FRAMES`, at debug level: what they bind,
+    /// read and write (diagnostics builds). A dispatch writes through its
+    /// unordered access views (`uav` among its reads), not render targets.
     #[cfg(feature = "diagnostics")]
-    fn trace(&self, kind: &str, count: u32, first: u32) {
+    fn trace(&self, what: impl FnOnce() -> String, compute: bool) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
         let listed = crate::capture::listed(crate::queue::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        if compute {
+            let line = format!("{} pipeline {:#x} reads {:?}", what(), self.pipeline, self.reads(true));
+            if logged {
+                tracing::debug!("draw {line}");
+            }
+            let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+            if frame.len() < 256 {
+                frame.push(line);
+            }
+            return;
+        }
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&t| Some((t, crate::resource::host_resource(t as This)?)))
+            .map(|(r, t)| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                format!("{r:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
             })
             .collect();
         let v = self.vertex[0];
         let line = format!(
-            "{kind} {count} from {first} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            "{} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            what(),
             self.topology,
             self.pipeline,
             v.address,
@@ -843,7 +869,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("draw", vertices, first);
+        self.trace(|| format!("draw {vertices} from {first}"), false);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
@@ -934,7 +960,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("indexed", indices, first);
+        self.trace(|| format!("indexed {indices} from {first}"), false);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
@@ -1151,19 +1177,29 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
-    let texture = |r: This| {
+    // The title resource (as the target dumps and present comparison name
+    // it), the host texture, and the format the view names (0: none).
+    let texture = |r: This, desc: &Option<[u32; 10]>| {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{r:?} {}x{} f{} flags {:#x} view f{} title f{}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                d.Flags.0,
+                desc.map_or(0, |d| d[0]),
+                crate::resource::title_format(r)
+            )
         })
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
+        Some(v @ View::Shader(r, desc)) => texture(*r as This, desc)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
         // A buffer has no host texture: its title range, as for a shader view.
-        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+        Some(v @ View::Unordered(r, _, desc)) => texture(*r as This, desc).map_or_else(
             || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
             |t| format!("uav {t}"),
         ),

@@ -273,6 +273,11 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether `format` is the typeless head of its family.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    family(format) == format && family(format + 1) == format
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -285,6 +290,11 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
+}
+
+/// The title's own format of a title texture, as the host has it.
+pub(crate) fn title_format(this: This) -> u32 {
+    pc_format(resource(this).desc.format)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders

@@ -569,14 +569,21 @@ fn buffer_uav(
 }
 
 /// Whether the host can make a shader (or unordered access) view of
-/// `texture` in `format` (none: the texture's own). The console allows any
-/// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
+/// `texture` in `format` (none: the texture's own), for a title texture in
+/// format `title`. The console allows any view; the host refuses (and
+/// removes the device for) views without the resource's permission, of
+/// typed depth, and in another format than a typed resource's. A view of a
+/// typed texture in another format of its family takes the texture's
+/// format; one of a typeless texture takes [`typed_view_format`] (callers
+/// give views of typeless textures a description, see [`whole_srv`]).
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(
+    texture: &ID3D12Resource,
+    title: u32,
+    format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -595,30 +602,165 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
-    // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
-    }
+    let typeless = crate::resource::is_typeless(own);
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
-    }
-    if family(view) != family(own) {
+    if view != 0 && family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
+    match format {
+        None => !typeless,
+        Some(format) if typeless => {
+            let typed = typed_view_format(view, title, unordered);
+            if typed == 0 || family(typed) != family(own) {
+                once!(view, title, own, "no typed view format for a typeless texture");
+                return false;
+            }
+            format.0 = typed as i32;
+            true
+        }
+        Some(format) => {
+            *format = d.Format;
+            true
+        }
     }
-    true
+}
+
+/// The format the host must name for a view of a typeless texture (the
+/// host takes no typeless or depth view formats): the view's own if typed
+/// (`named`, 0 for none), else the title texture's (`title`), depth read as
+/// its red channel, a typeless one as its family's first typed format, and
+/// sRGB as linear for unordered access (the host has no sRGB unordered
+/// access). 0 if there is none.
+/// shortcut: a typeless format reads as its family's first typed format
+/// (UNORM, or FLOAT for float-only families); a title naming a typeless
+/// view of a typeless texture may mean another numeric type.
+fn typed_view_format(named: u32, title: u32, unordered: bool) -> u32 {
+    use crate::resource::is_typeless;
+    let format = if named != 0 && !is_typeless(named) { named } else { title };
+    let format = match format {
+        // Depth families: depth as the red channel.
+        19 | 20 => 21,
+        39 | 40 => 41,
+        44 | 45 => 46,
+        55 => 56,
+        // B8G8R8A8 and B8G8R8X8, whose typed formats come before them.
+        90 => 87,
+        92 => 88,
+        f if is_typeless(f) => f + 1,
+        f => f,
+    };
+    match crate::resource::SRGB.iter().find(|&&(s, _)| s == format) {
+        Some(&(_, linear)) if unordered => linear,
+        _ => format,
+    }
+}
+
+/// The view a null description makes: all of `d`, in its format. A
+/// typeless texture needs a format named, so its views without a
+/// description get this one for [`fits`] to type.
+fn whole_srv(d: &D3D12_RESOURCE_DESC) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: d.Format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    let (array, all) = (u32::from(d.DepthOrArraySize), u32::MAX);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            v.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: all,
+                ArraySize: array,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            v.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MipLevels: all,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            v.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: all,
+                ..Default::default()
+            };
+        }
+        _ if d.SampleDesc.Count > 1 && array > 1 => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            v.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                ArraySize: array,
+                ..Default::default()
+            };
+        }
+        _ if d.SampleDesc.Count > 1 => v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
+        _ if array > 1 => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: all,
+                ArraySize: array,
+                ..Default::default()
+            };
+        }
+        _ => {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: all,
+                ..Default::default()
+            };
+        }
+    }
+    v
+}
+
+/// As [`whole_srv`], for unordered access (mip 0, every slice).
+fn whole_uav(d: &D3D12_RESOURCE_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut v = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: d.Format,
+        ..Default::default()
+    };
+    let array = u32::from(d.DepthOrArraySize);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => {
+            v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            v.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: array,
+                ..Default::default()
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D,
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            v.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ if array > 1 => {
+            v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: array,
+                ..Default::default()
+            };
+        }
+        _ => v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D,
+    }
+    v
+}
+
+/// The description a view of `texture` is made with: the title's, or for
+/// a typeless texture without one, a whole view to be typed.
+fn texture_desc<T>(
+    texture: &ID3D12Resource,
+    desc: Option<T>,
+    whole: fn(&D3D12_RESOURCE_DESC) -> T,
+) -> Option<T> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    desc.or_else(|| crate::resource::is_typeless(d.Format.0 as u32).then(|| whole(&d)))
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -648,8 +790,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                let mut desc = texture_desc(texture, desc.as_ref().map(srv_desc), whole_srv);
+                let title = crate::resource::title_format(resource);
+                if !fits(texture, title, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -679,8 +822,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            let mut desc = texture_desc(texture, desc.as_ref().map(uav_desc), whole_uav);
+            let title = crate::resource::title_format(resource);
+            if !fits(texture, title, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -941,6 +1085,139 @@ mod tests {
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
         // Multisampled UAVs need a cap; they stay 2D.
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// The host takes no typeless or depth view formats; the console reads
+    /// such views (and views without a description) in the texture's own.
+    #[test]
+    fn views_of_typeless_textures_name_typed_formats() {
+        // A typeless view of a typeless texture: the family's first typed.
+        assert_eq!(typed_view_format(27, 27, false), 28);
+        assert_eq!(typed_view_format(0, 9, false), 10);
+        assert_eq!(typed_view_format(90, 90, false), 87);
+        assert_eq!(typed_view_format(0, 23, false), 24);
+        // Copies the host made typeless: sRGB with unordered access, and
+        // depth that shaders read, take the title's own format, readable.
+        assert_eq!(typed_view_format(0, 29, false), 29);
+        assert_eq!(typed_view_format(27, 29, true), 28);
+        assert_eq!(typed_view_format(0, 40, false), 41);
+        assert_eq!(typed_view_format(0, 45, false), 46);
+        assert_eq!(typed_view_format(0, 55, false), 56);
+        assert_eq!(typed_view_format(20, 20, false), 21);
+        // A typed view keeps its format (sRGB linear for unordered access).
+        assert_eq!(typed_view_format(28, 27, false), 28);
+        assert_eq!(typed_view_format(91, 90, true), 87);
+        // No format at all: none to give.
+        assert_eq!(typed_view_format(0, 0, false), 0);
+    }
+
+    /// A typeless texture's views, with a description or without, get a
+    /// typed format on the real device (before, the one without was not
+    /// made, and the other named the typeless format the host refuses).
+    #[test]
+    fn typeless_textures_get_typed_views() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let texture = |format, flags| synthetic(host, format, flags);
+        let unordered = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        // The title's sRGB texture with unordered access: typeless here.
+        let srgb = texture(DXGI_FORMAT_R8G8B8A8_TYPELESS, unordered);
+        let mut srv = texture_desc(&srgb, None, whole_srv).expect("a description to type");
+        assert!(fits(&srgb, 29, Some(&mut srv.Format), false));
+        assert_eq!(srv.Format, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        let mut uav = texture_desc(&srgb, None, whole_uav).expect("a description to type");
+        assert!(fits(&srgb, 29, Some(&mut uav.Format), true));
+        assert_eq!(uav.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        // A typeless view the title names of its typeless texture.
+        let mut named = srv;
+        named.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        assert!(fits(&srgb, 27, Some(&mut named.Format), false));
+        assert_eq!(named.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        // A typed texture needs no description and keeps its format.
+        let typed = texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        assert!(texture_desc(&typed, None, whole_srv).is_none());
+        assert!(fits(&typed, 28, None, false));
+        // SAFETY: live textures, typed descriptions and slots of our heap.
+        unsafe {
+            host.device.CreateShaderResourceView(&srgb, Some(&srv), heap.cpu(0));
+            host.device.CreateShaderResourceView(&srgb, Some(&named), heap.cpu(1));
+            host.device
+                .CreateUnorderedAccessView(&srgb, None, Some(&uav), heap.cpu(2));
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+    }
+
+    /// An 8x4 texture in `format`, in the common state.
+    fn synthetic(
+        host: &crate::host::Host,
+        format: DXGI_FORMAT,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> ID3D12Resource {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: flags,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut t: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation with a valid description.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut t,
+            )
+        }
+        .expect("synthetic texture");
+        t.unwrap()
+    }
+
+    /// With the debug layer: the typeless view format the host was given
+    /// before is an error (the view is undefined), the typed one is not.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a hardware D3D12 device and VICTORY_D3D12_DEBUG=1"]
+    fn the_host_refuses_typeless_view_formats() {
+        let host = host().expect("host D3D12 device");
+        let heap = HostHeap::new(false, 4).expect("view heap");
+        let texture = synthetic(
+            host,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let _ = host.log_messages();
+        // SAFETY: a live resource.
+        let mut desc = whole_srv(&unsafe { texture.GetDesc() });
+        // SAFETY: a live texture and a slot of our heap.
+        unsafe { host.device.CreateShaderResourceView(&texture, Some(&desc), heap.cpu(0)) };
+        assert!(
+            host.log_messages().is_some(),
+            "a typeless view format is refused (needs VICTORY_D3D12_DEBUG=1 and the debug layer)"
+        );
+        assert!(fits(&texture, 27, Some(&mut desc.Format), false));
+        // SAFETY: as above.
+        unsafe { host.device.CreateShaderResourceView(&texture, Some(&desc), heap.cpu(1)) };
+        assert_eq!(host.log_messages(), None);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
