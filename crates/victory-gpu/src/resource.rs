@@ -958,6 +958,9 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if !fills(&desc) {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        targets_at().insert(resource.data() as u64, at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -983,8 +986,16 @@ impl Drop for Resource {
                 );
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        let this = std::ptr::from_ref::<Resource>(self) as usize;
+        if self.desc.dimension != BUFFER && !fills(&self.desc) {
+            let mut targets = targets_at();
+            let at = self.data() as u64;
+            if targets.get(&at) == Some(&this) {
+                targets.remove(&at);
+            }
+        }
+        crate::texture::forget(this);
+        crate::descriptor::forget(this);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -1144,6 +1155,85 @@ pub(crate) extern "system" fn create_at_address(
         iid,
         out,
     )
+}
+
+/// Whether a texture described by `desc` takes its contents from title
+/// memory: one the host neither renders to nor writes (no target, depth or
+/// unordered access flag).
+#[cfg(windows)]
+fn fills(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// The title textures the host renders to or writes (targets, depth,
+/// unordered access), by the address of their memory: what a view the
+/// title places in that memory in another format shows ([`alias_of`]). A
+/// texture leaves the table before it is freed.
+#[cfg(windows)]
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+fn targets_at() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, usize>> {
+    TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// For `this`, the texture of a view the title placed in memory
+/// ([`texture_at`]): the title texture the host writes that lies in the
+/// same memory, if there is one of the same size, levels and layers with
+/// texels of the same width. The console reads such a texture through the
+/// view as it is: the title packs light as R9G9B9E5 into R32_UINT textures
+/// with compute shaders (which cannot write R9G9B9E5) and samples them
+/// through R9G9B9E5 views placed at the textures' addresses (the sky, the
+/// sky and light probes, the bounced light the lighting pass adds). On the
+/// host the two are two textures and what the shaders wrote exists in one
+/// of them only: the other was filled from title memory, which nothing
+/// writes, so everything read through such a view was black.
+/// Textures of several levels or layers count (the screen probes' light
+/// atlas has four levels, the camera's sky light cache six layers, the
+/// cloud and sky tables are volumes).
+/// `VICTORY_ALIAS_COPY=0`: none is found; `=1`: only textures of one level
+/// and one layer.
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_ALIAS_COPY").ok().as_deref().map(str::trim) {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => 2,
+        }
+    });
+    if this.is_null() || mode == 0 {
+        return None;
+    }
+    let r = resource(this);
+    // A level count of 0 asks for a full chain: not counted here.
+    let one = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && (mode == 2 || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    if !fills(&r.desc) || !one(&r.desc) {
+        return None;
+    }
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = targets_at();
+    let other = *targets.get(&(r.data() as u64))? as This;
+    let o = resource(other);
+    const DEPTH: u32 = 0x2;
+    let same = one(&o.desc)
+        && o.desc.dimension == r.desc.dimension
+        && o.desc.width == r.desc.width
+        && o.desc.height == r.desc.height
+        && o.desc.mip_levels == r.desc.mip_levels
+        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+        && o.desc.flags & DEPTH == 0
+        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    same.then_some(other)
 }
 
 /// Textures the title placed in its own memory and views without a

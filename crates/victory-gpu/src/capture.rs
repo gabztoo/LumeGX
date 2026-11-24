@@ -332,6 +332,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         87 | 88 | 90..=93 => true,
         _ => {
             let (n, decode) = decoder(format)?;
+            if format == 42 {
+                packed_light(w, h, |x, y| {
+                    u32::from_le_bytes(px(x, y, 4).try_into().unwrap_or([0; 4]))
+                });
+            }
             return Some(scaled(format, w, h, |x, y| decode(px(x, y, n)), out));
         }
     };
@@ -416,12 +421,78 @@ fn scaled(
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    // How much of the target holds anything: a lit scene and one bright
+    // lamp on black have the same highest value.
+    let above = values
+        .iter()
+        .filter(|v| v.iter().any(|c| c.is_finite() && *c > low))
+        .count();
+    let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
+    tracing::info!(format, low, high, nonzero_percent, "target values");
     for v in values {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
     out
+}
+
+/// R32_UINT targets (host format 42) the title reads back as R9G9B9E5
+/// hold packed light: as floats their low, high and share above the lowest
+/// say nothing. Logs how many texels hold any bit and the highest channel
+/// of the packed reading (`2^(e - 24)` times each 9-bit channel), and the
+/// words as plain numbers by class: in the title's shadow-mask table 0 is
+/// a block in full shadow, a word up to 255 one value for the block, above
+/// that a block of the atlas, and all ones a texel never written.
+/// Instrumentation only: it changes what a dump reports, not what is drawn.
+fn packed_light(w: usize, h: usize, word: impl Fn(usize, usize) -> u32) {
+    let (mut set, mut packed_high) = (0usize, 0f32);
+    let mut classes = [0usize; 6];
+    let mut highest_below_ones = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            let v = word(x, y);
+            set += usize::from(v != 0);
+            packed_high = packed_high.max(r9g9b9e5(v).into_iter().fold(0.0, f32::max));
+            classes[match v {
+                0 => 0,
+                1..=15 => 1,
+                16..=255 => 2,
+                256..=0x00ff_ffff => 3,
+                u32::MAX => 5,
+                _ => 4,
+            }] += 1;
+            if v != u32::MAX {
+                highest_below_ones = highest_below_ones.max(v);
+            }
+        }
+    }
+    let nonzero_bits_percent = set as f32 * 100.0 / (w * h).max(1) as f32;
+    tracing::info!(
+        format = 42,
+        nonzero_bits_percent,
+        packed_high,
+        "target values as packed light"
+    );
+    tracing::info!(
+        format = 42,
+        width = w,
+        height = h,
+        zero = classes[0],
+        one_to_15 = classes[1],
+        to_255 = classes[2],
+        to_24_bits = classes[3],
+        larger = classes[4],
+        all_ones = classes[5],
+        highest_below_ones,
+        "target values as words"
+    );
+}
+
+/// The red, green and blue of an R9G9B9E5 word: three 9-bit mantissas
+/// (red lowest) scaled by `2^(e - 24)`, `e` the top 5 bits.
+fn r9g9b9e5(v: u32) -> [f32; 3] {
+    let scale = 2f32.powi((v >> 27) as i32 - 24);
+    [0, 1, 2].map(|k| (v >> (9 * k) & 0x1ff) as f32 * scale)
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -613,5 +684,15 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// R9G9B9E5: red in the low 9 bits, then green and blue, scaled by
+    /// `2^(e - 24)` with `e` the top 5 bits (15 is the exponent bias, 9
+    /// the mantissa bits).
+    #[test]
+    fn packed_light_reads_as_r9g9b9e5() {
+        assert_eq!(super::r9g9b9e5(24 << 27 | 3 << 18 | 2 << 9 | 1), [1.0, 2.0, 3.0]);
+        assert_eq!(super::r9g9b9e5(15 << 27 | 256), [0.5, 0.0, 0.0]);
+        assert_eq!(super::r9g9b9e5(0), [0.0; 3]);
     }
 }
