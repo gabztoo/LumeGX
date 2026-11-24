@@ -172,6 +172,25 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
     }
 }
 
+/// `image_sample` (implicit level) in a compute program: there are no
+/// screen derivatives outside a pixel shader, and the validator refuses
+/// DXIL's `sample` there; it reads level 0 instead.
+#[test]
+fn an_implicit_level_sample_in_compute_reads_level_0() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    // image_sample_lz (opcode 0x27) -> image_sample (0x20), same operands.
+    let words: Vec<u32> = WATERFALL_JOINED_WAVE32
+        .iter()
+        .map(|&w| if w == 0xF09C_0F08 { 0xF080_0F08 } else { w })
+        .collect();
+    assert_ne!(words, WATERFALL_JOINED_WAVE32);
+    let shader = build(&words, false);
+    for (label, red) in sampled(&shader) {
+        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
