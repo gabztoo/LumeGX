@@ -251,6 +251,7 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -332,6 +333,9 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        // Root UAV tables: their ranges, and (parameter, range, visibility).
+        let mut uav_ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = Vec::new();
+        let mut table_of = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -339,6 +343,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -382,6 +387,25 @@ impl HostPipeline {
                     });
                 }
             }
+            // Root UAVs: a table of one bounded view each (a root view has
+            // no bounds; see `draw::State::bind`).
+            for &slot in &t.root_uavs {
+                stage.root_uavs.push((slot, params.len() as u32));
+                uav_ranges.push(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: u32::from(slot),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                });
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    ..Default::default()
+                });
+                table_of.push((params.len() - 1, uav_ranges.len() - 1, visibility));
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
@@ -400,6 +424,14 @@ impl HostPipeline {
                 });
             }
             bound.push(stage);
+        }
+        // The ranges are complete: point the tables at them.
+        for (param, range, visibility) in table_of {
+            params[param].Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &uav_ranges[range],
+            };
+            params[param].ShaderVisibility = visibility;
         }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
@@ -435,7 +467,13 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    // A program that declares the console's wave size needs
+                    // a host with waves that size (NVIDIA's are 32 lanes).
+                    let wave_lanes = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .and_then(|t| wave_lanes(&t.host.dxil));
+                    tracing::warn!(error = %e, ?shaders, ?wave_lanes, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -663,5 +701,47 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+/// The wave size a translated program declares (`WaveSize`, from its
+/// pipeline state validation part), if it declares one.
+fn wave_lanes(dxil: &[u8]) -> Option<u32> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let info = container.part(victory_shader::FourCC::PSV0)?.data;
+    // The info's size, then minimum and maximum wave lanes at 16 and 20.
+    let min = u32::from_le_bytes(info.get(20..24)?.try_into().ok()?);
+    (min != 0).then_some(min)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A container with one PSV0 part whose info declares `min..=max`
+    /// wave lanes (as the emitter writes it).
+    fn container(min: u32, max: u32) -> Vec<u8> {
+        let mut info = vec![0u8; 52];
+        info[0..4].copy_from_slice(&48u32.to_le_bytes());
+        info[20..24].copy_from_slice(&min.to_le_bytes());
+        info[24..28].copy_from_slice(&max.to_le_bytes());
+        let part_at = 0x20 + 4;
+        let total = part_at + 8 + info.len();
+        let mut c = b"DXBC".to_vec();
+        c.extend([0u8; 16]);
+        c.extend(1u16.to_le_bytes());
+        c.extend(0u16.to_le_bytes());
+        c.extend((total as u32).to_le_bytes());
+        c.extend(1u32.to_le_bytes());
+        c.extend((part_at as u32).to_le_bytes());
+        c.extend(b"PSV0");
+        c.extend((info.len() as u32).to_le_bytes());
+        c.extend(info);
+        c
+    }
+
+    #[test]
+    fn declared_wave_lanes_are_read_from_the_container() {
+        assert_eq!(super::wave_lanes(&container(64, 64)), Some(64));
+        assert_eq!(super::wave_lanes(&container(0, u32::MAX)), None);
+        assert_eq!(super::wave_lanes(b"not a container"), None);
     }
 }

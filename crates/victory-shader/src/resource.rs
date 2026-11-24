@@ -11,6 +11,13 @@
 //! descriptor's address itself. Each descriptor operand and each scalar
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
+//!
+//! A compute root signature with more user data than the 16 user SGPRs
+//! starts at user-data dword 16: the console passes the address of a table
+//! holding dwords 16 on in s[0:1] (40 bits: the high dword's low byte), and
+//! the code loads parameters from it with `s_load_dword*` ([`USER_TABLE`]).
+//! Those loads read user data, as user SGPRs would hold it
+//! ([`Resources::user_loads`]).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -117,7 +124,14 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Loads from the user-data table ([`USER_TABLE`]): what they load are
+    /// root-parameter dwords (in [`Resources::params`]), not memory.
+    pub user_loads: Vec<Site>,
 }
+
+/// The first user-data dword a compute program's user-data table holds
+/// (dwords below it are user SGPRs).
+pub const USER_TABLE: u32 = 16;
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
 /// reads the first active lane's descriptor with `v_readfirstlane_b32`,
@@ -151,15 +165,22 @@ pub fn track(
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage, lanes)?;
+    let loaded = t
+        .user_loads
+        .iter()
+        .flat_map(|&(b, i)| p.blocks[b].insts[i].writes.iter().map(|w| w.1));
     let mut out = Resources {
         params: p
             .inputs
             .iter()
-            .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
+            .map(|i| i.1)
+            .chain(loaded)
+            .filter_map(|v| {
+                let (param, dword) = t.param_of_value(v)?;
                 Some((v, param, dword))
             })
             .collect(),
+        user_loads: t.user_loads.clone(),
         ..Resources::default()
     };
     // Group accesses in the same loop so a shared mask can select several
@@ -208,6 +229,9 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
+                    if t.user_loads.contains(&site) {
+                        continue;
+                    }
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -297,6 +321,11 @@ struct Tracer<'a> {
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
     lanes: Option<&'a Structured>,
+    /// The user-data dword each value holds: user SGPRs on entry, and what
+    /// loads from the user-data table load.
+    user: Vec<Option<u32>>,
+    /// Those loads ([`USER_TABLE`]).
+    user_loads: Vec<Site>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
 }
@@ -360,9 +389,96 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            user: vec![None; n],
+            user_loads: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
+        t.find_user_data();
         Ok(t)
+    }
+
+    /// The user-data dword of each user SGPR on entry and of each dword a
+    /// load from the user-data table loads.
+    fn find_user_data(&mut self) {
+        for &(reg, v) in &self.p.inputs {
+            if let Reg::S(code) = reg {
+                self.user[v.0 as usize] = self.stage.user_data_of(code);
+            }
+        }
+        let table = self.stage == HwStage::Cs
+            && self.layout.iter().any(|p| u32::from(p.user_data) >= USER_TABLE)
+            // No root parameter's SGPRs overlap the table's address.
+            && self.param_of(Reg::S(0)).is_none()
+            && self.param_of(Reg::S(1)).is_none();
+        let entry = |code| self.p.inputs.iter().find(|i| i.0 == Reg::S(code)).map(|i| i.1);
+        let (true, Some(lo), Some(hi)) = (table, entry(0), entry(1)) else {
+            return;
+        };
+        let mut found = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Smem {
+                    base: Operand::Scalar { code: base, .. },
+                    data: Some(Operand::Scalar { code: data, .. }),
+                    offset,
+                    soffset,
+                    ..
+                } = inst.fields
+                else {
+                    continue;
+                };
+                let plain = matches!(soffset, Operand::Scalar { code: NULL, .. });
+                if !inst.name().starts_with("s_load_dword") || !plain || offset < 0 || offset % 4 != 0
+                {
+                    continue;
+                }
+                let word = |k| inst.read(Reg::S(base + k)).map(|v| self.origin(v));
+                let high = word(1).is_some_and(|h| self.table_high(h, hi));
+                if word(0) != Some(Term::Value(lo)) || !high {
+                    continue;
+                }
+                for &(reg, v) in &inst.writes {
+                    if let Reg::S(code) = reg
+                        && let Some(k) = code.checked_sub(data)
+                    {
+                        let index = USER_TABLE + offset as u32 / 4 + u32::from(k);
+                        self.user[v.0 as usize] = Some(index);
+                    }
+                }
+                found.push((b, i));
+            }
+        }
+        self.user_loads = found;
+    }
+
+    /// `h` is the table address's high dword: `hi` on entry, or its low
+    /// byte or bytes (`s_and_b32` with 0xff or 0xffff).
+    fn table_high(&self, h: Term, hi: Value) -> bool {
+        let low_bytes = |t: [Term; 2]| match t {
+            [Term::Value(x), Term::Const(0xff | 0xffff)]
+            | [Term::Const(0xff | 0xffff), Term::Value(x)] => x == hi,
+            _ => false,
+        };
+        h == Term::Value(hi)
+            || matches!(h, Term::Value(v)
+                if self.sop2(v, &["s_and_b32"]).is_some_and(|(_, t)| low_bytes(t)))
+    }
+
+    /// Layout index and dword of the root parameter `v` holds, if it holds
+    /// user data ([`Self::find_user_data`]).
+    fn param_of_value(&self, v: Value) -> Option<(usize, u32)> {
+        let index = self.user[v.0 as usize]?;
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            let dword = index.checked_sub(p.user_data.into())?;
+            (dword < p.sgprs).then_some((i, dword))
+        })
+    }
+
+    /// A value holding dword `dword` of root parameter `param`.
+    fn param_value(&self, param: usize, dword: u32) -> Option<Value> {
+        let index = u32::from(self.layout[param].user_data) + dword;
+        let v = self.user.iter().position(|&u| u == Some(index))?;
+        Some(Value(v as u32))
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -487,8 +603,8 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
+        if self.user[v.0 as usize].is_some() || self.inputs[v.0 as usize].is_some() {
+            return match self.param_of_value(v) {
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -646,17 +762,15 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_of_value(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.param_value(param, 1)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
@@ -1833,6 +1947,64 @@ pub(crate) mod tests {
         assert_eq!(
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0), (0, 1)]
+        );
+    }
+
+    /// A compute root signature past the 16 user SGPRs (wave32, written
+    /// for this test): the user data from dword 16 on is in a table at
+    /// s[0:1] (its high dword's low bytes), and loads from it read root
+    /// parameters as user SGPRs would hold them. Lane i stores the root
+    /// constant (dword 16) into the root UAV (dwords 18 and 19).
+    pub(crate) const USER_TABLE_WAVE32: &[u32] = &[
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0x8703_FF01,
+        0x0000_FFFF, // s_and_b32 s3, s1, 0xffff
+        0xF400_0181,
+        0xFA00_0000, // s_load_dword s6, s[2:3], null (user data 16)
+        0xF404_0101,
+        0xFA00_0008, // s_load_dwordx2 s[4:5], s[2:3], 0x8 (user data 18, 19)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE8C_0304, // s_mov_b32 s12, s4
+        0x880D_FF05,
+        0x0001_0000, // s_or_b32 s13, s5, 0x10000
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF,
+        0x1101_4FAC, // s_mov_b32 s15, 0x11014fac
+        0x4A02_0006, // v_add_nc_u32 v1, s6, v0
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8003_0102, // buffer_store_dword v1, v2, s[12:15], 0 offen
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn user_data_past_the_sgprs_is_loaded_from_its_table() {
+        let layout = [param(Constants, 16, 1), param(Descriptor, 18, 2)];
+        let r = track_words(USER_TABLE_WAVE32, &layout, HwStage::Cs);
+        assert_eq!(r.user_loads, [(0, 2), (0, 3)]);
+        assert!(r.scalar.is_empty(), "{:?}", r.scalar);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(1, 0),
+                bits: 0x1_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        let mut params: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
+        params.sort_unstable();
+        assert_eq!(params, [(0, 0), (1, 0), (1, 1)]);
+        // Outside compute programs s[0:1] holds no such table: the load
+        // stays a memory read the tracer cannot place.
+        let code: Vec<u8> = USER_TABLE_WAVE32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &layout, HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 12,
+                what: "an address in an SGPR that is no root parameter"
+            }
         );
     }
 

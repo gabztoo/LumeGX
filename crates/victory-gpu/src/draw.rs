@@ -158,6 +158,7 @@ macro_rules! once {
     }};
 }
 
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -491,26 +492,56 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            const CBV: u8 = 0;
+            const SRV: u8 = 1;
+            const UAV: u8 = 2;
+            let views = [
+                (&stage.root_cbvs, CBV),
+                (&stage.root_srvs, SRV),
+                (&stage.root_uavs, UAV),
+            ];
+            for (views, kind) in views {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        self.table_failed |= kind == UAV;
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    if kind == UAV {
+                        // A bounded view in a dynamic slot; without one the
+                        // shader would write through an unbound root
+                        // parameter, so the draw or dispatch is dropped.
+                        match self.root_uav(list, *address) {
+                            // SAFETY: an open list; the slot views live memory.
+                            Some(table) => unsafe {
+                                if compute {
+                                    l.SetComputeRootDescriptorTable(param, table);
+                                } else {
+                                    l.SetGraphicsRootDescriptorTable(param, table);
+                                }
+                            },
+                            None => self.table_failed = true,
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, *address, kind == SRV) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, CBV) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, _) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (true, CBV) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, _) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
                 }
+            }
+            if self.table_failed {
+                once!("a draw or dispatch dropped: a root UAV could not be bound");
+                return false;
             }
         }
         true
@@ -518,11 +549,22 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let _ran = self.run_dispatch(list, x, y, z);
+        // Traced once its tables are bound: compute writes through them.
+        #[cfg(feature = "diagnostics")]
+        self.trace(
+            || format!("dispatch {x}x{y}x{z}{}", if _ran { "" } else { " DROPPED" }),
+            true,
+        );
+    }
+
+    /// Runs a dispatch on the host; false if it was dropped.
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -532,21 +574,22 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -574,7 +617,8 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            let views = stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs);
+            for &(slot, _) in views {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -590,7 +634,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        self.trace(|| format!("mesh {x} from 0"), false);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -608,6 +652,46 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A root UAV at title address `address`, as a raw unordered access view
+    /// of its buffer's host copy in a dynamic slot of the bound view heap
+    /// (the root parameter is a table of it): bounded by the copy's end,
+    /// where a root view has no bounds and a write past it faults the GPU.
+    /// The range is copied in before and back to title memory after, as a
+    /// table's unordered access view is. `None` if it cannot be made.
+    /// shortcut: a root view has no size; 1 MiB is copied (cut at the
+    /// buffer's end), as for a root SRV, while the view spans the rest of
+    /// the buffer; what shaders write past 1 MiB stays in the host copy.
+    fn root_uav(&mut self, list: &HostList, address: u64) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let shadow = crate::shadow::find(address, 1)?;
+        // SAFETY: a live buffer.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            once!("a root UAV whose host copy shaders cannot write");
+            return None;
+        }
+        // Raw views start on 16 bytes; one starting below the address would
+        // shift every access the shader makes from it.
+        // shortcut: such a root UAV is not bound (its draw or dispatch is
+        // dropped); pass the start's misalignment to the shader to add to
+        // its offsets if those passes matter.
+        let offset = shadow.offset(address);
+        if offset % 16 != 0 {
+            once!(offset, "a root UAV not on 16 bytes of its host copy");
+            return None;
+        }
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
+        let host = heap.host()?;
+        let index = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+        let left = shadow.left(address);
+        let elements = u32::try_from(left / 4).unwrap_or(u32::MAX);
+        host.raw_uav_at(index, &shadow.buffer, offset / 4, elements);
+        let len = left.min(1 << 20);
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        Some(host.gpu(index))
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -768,29 +852,43 @@ impl State {
         made
     }
 
-    /// The first draws, at debug level: what they bind and read
-    /// (diagnostics builds).
+    /// The first draws and dispatches, and all of those of the frames
+    /// listed in `VICTORY_CAPTURE_FRAMES`, at debug level: what they bind,
+    /// read and write (diagnostics builds). A dispatch writes through its
+    /// unordered access views (`uav` among its reads), not render targets.
     #[cfg(feature = "diagnostics")]
-    fn trace(&self, kind: &str, count: u32, first: u32) {
+    fn trace(&self, what: impl FnOnce() -> String, compute: bool) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
         let listed = crate::capture::listed(crate::queue::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
+        if compute {
+            let line = format!("{} pipeline {:#x} reads {:?}", what(), self.pipeline, self.reads(true));
+            if logged {
+                tracing::debug!("draw {line}");
+            }
+            let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+            if frame.len() < 256 {
+                frame.push(line);
+            }
+            return;
+        }
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&t| Some((t, crate::resource::host_resource(t as This)?)))
+            .map(|(r, t)| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                format!("{r:#x} {}x{} f{}", d.Width, d.Height, d.Format.0)
             })
             .collect();
         let v = self.vertex[0];
         let line = format!(
-            "{kind} {count} from {first} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            "{} topology {} pipeline {:#x} targets {targets:?} vb {:#x}+{} stride {} reads {:?}",
+            what(),
             self.topology,
             self.pipeline,
             v.address,
@@ -812,7 +910,10 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return vec!["no host pipeline".into()];
+            return vec![format!(
+                "no host pipeline: {}",
+                crate::pipeline::missing(self.pipeline as This)
+            )];
         };
         let mut out = Vec::new();
         for stage in &p.stages {
@@ -843,7 +944,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("draw", vertices, first);
+        self.trace(|| format!("draw {vertices} from {first}"), false);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
@@ -934,7 +1035,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("indexed", indices, first);
+        self.trace(|| format!("indexed {indices} from {first}"), false);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
@@ -965,6 +1066,25 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        signature: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.run_indirect(list, signature, arguments, count);
+        // Traced once its tables are bound, as a dispatch is.
+        #[cfg(feature = "diagnostics")]
+        {
+            let (kind, _, max) = signature;
+            let what = || format!("indirect kind {kind} max {max}{}", if ran { "" } else { " DROPPED" });
+            self.trace(what, kind == 2);
+        }
+        ran
+    }
+
+    /// [`State::execute_indirect`] on the host; false if it was dropped.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -1151,19 +1271,29 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
-    let texture = |r: This| {
+    // The title resource (as the target dumps and present comparison name
+    // it), the host texture, and the format the view names (0: none).
+    let texture = |r: This, desc: &Option<[u32; 10]>| {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{r:?} {}x{} f{} flags {:#x} view f{} title f{}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                d.Flags.0,
+                desc.map_or(0, |d| d[0]),
+                crate::resource::title_format(r)
+            )
         })
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
+        Some(v @ View::Shader(r, desc)) => texture(*r as This, desc)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
         // A buffer has no host texture: its title range, as for a shader view.
-        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+        Some(v @ View::Unordered(r, _, desc)) => texture(*r as This, desc).map_or_else(
             || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
             |t| format!("uav {t}"),
         ),

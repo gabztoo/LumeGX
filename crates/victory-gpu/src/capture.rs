@@ -325,30 +325,37 @@ fn small_float(bits: u32, man: u32) -> f32 {
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
+    // 8-bit color as is.
+    let swap = match format {
+        27..=32 => false,
+        // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
+        87 | 88 | 90..=93 => true,
+        _ => {
+            let (n, decode) = decoder(format)?;
+            return Some(scaled(format, w, h, |x, y| decode(px(x, y, n)), out));
+        }
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let p = px(x, y, 4);
+            out.extend(if swap { [p[2], p[1], p[0], 255] } else { [p[0], p[1], p[2], 255] });
+        }
+    }
+    Some(out)
+}
+
+/// A pixel's channel values (red, green, blue) from its bytes.
+type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
+
+/// Bytes per pixel of a host format and how to read a pixel's channels:
+/// as stored (8-bit color as bytes, integers as integers, floats as
+/// floats). `None` for formats not handled.
+fn decoder(format: u32) -> Option<(usize, Decode)> {
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
-    // Channel values as floats, then scaled.
-    type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
-    let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
-            for y in 0..h {
-                for x in 0..w {
-                    let p = px(x, y, 4);
-                    out.extend([p[0], p[1], p[2], 255]);
-                }
-            }
-            return Some(out);
-        }
-        // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
-        87 | 88 | 90..=93 => {
-            for y in 0..h {
-                for x in 0..w {
-                    let p = px(x, y, 4);
-                    out.extend([p[2], p[1], p[0], 255]);
-                }
-            }
-            return Some(out);
-        }
+    Some(match format {
+        27..=32 => (4, Box::new(|b| [b[0], b[1], b[2]].map(f32::from))),
+        87 | 88 | 90..=93 => (4, Box::new(|b| [b[2], b[1], b[0]].map(f32::from))),
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
@@ -374,10 +381,32 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
-    };
+    })
+}
+
+/// The value of a channel at full scale: 1 for floats.
+fn unit(format: u32) -> f32 {
+    match format {
+        27..=32 | 48..=52 | 60..=65 | 87..=88 | 90..=93 => 255.0,
+        23..=25 | 89 => 1023.0,
+        11..=14 | 35..=38 | 55..=59 => 65535.0,
+        44..=47 => 16_777_215.0,
+        _ => 1.0,
+    }
+}
+
+/// Decoded values as 8-bit RGBA, scaled so the largest finite one is white
+/// (single channels: lowest black, highest white, as grey).
+fn scaled(
+    format: u32,
+    w: usize,
+    h: usize,
+    value: impl Fn(usize, usize) -> [f32; 3],
+    mut out: Vec<u8>,
+) -> Vec<u8> {
     let values: Vec<[f32; 3]> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
-        .map(|(x, y)| decode(px(x, y, n)))
+        .map(|(x, y)| value(x, y))
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
@@ -392,7 +421,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
-    Some(out)
+    out
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -411,6 +440,26 @@ pub(crate) fn probe(
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
+        return None;
+    }
+    probe_any(device, list, texture)
+}
+
+/// As [`probe`], for any single-sampled 2D color format [`decoder`] reads
+/// (mip 0, slice 0); read with [`probe_values`].
+pub(crate) fn probe_any(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+) -> Option<ID3D12Resource> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    // Depth and multisampled textures are copied whole only.
+    if decoder(d.Format.0 as u32).is_none()
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.SampleDesc.Count != 1
+        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+    {
         return None;
     }
     let desc = D3D12_RESOURCE_DESC {
@@ -498,6 +547,26 @@ fn probe_colors(buffer: &ID3D12Resource) -> Option<[[u8; 3]; (GRID * GRID) as us
         });
         buffer.Unmap(0, None);
         Some(colors)
+    }
+}
+
+/// Sampled channel values of a [`probe_any`] buffer of a `format` texture,
+/// at full scale 1 (floats as they are).
+pub(crate) fn probe_values(buffer: &ID3D12Resource, format: u32) -> Option<Vec<[f32; 3]>> {
+    let (n, decode) = decoder(format)?;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copies finished (every submission is waited for); read
+    // only the pixel bytes the GPU wrote, not the placement padding.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let values = (0..(GRID * GRID) as usize)
+            .map(|i| {
+                let pixel = std::slice::from_raw_parts(data.cast::<u8>().add(i * SLOT as usize), n);
+                decode(pixel).map(|c| c / unit(format))
+            })
+            .collect();
+        buffer.Unmap(0, None);
+        Some(values)
     }
 }
 

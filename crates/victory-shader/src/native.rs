@@ -146,6 +146,12 @@ impl HwStage {
             HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
         }
     }
+
+    /// The user-data dword SGPR `code` holds on entry ([`Self::user_sgpr`]
+    /// inverted); `None` below the first.
+    pub fn user_data_of(self, code: u8) -> Option<u32> {
+        code.checked_sub(self.user_sgpr(0)).map(u32::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

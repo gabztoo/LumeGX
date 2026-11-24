@@ -1,4 +1,5 @@
-//! Opt-in comparison of a selected target and the actual swap-chain image.
+//! Opt-in comparison of selected targets and the actual swap-chain image,
+//! in the same present.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -17,7 +18,8 @@ fn parse_spec(value: &str) -> Option<Spec> {
         height.parse().ok()?,
         DXGI_FORMAT(format.parse().ok()?),
     );
-    (width != 0 && height != 0 && family(format).is_some()).then_some((width, height, format))
+    (width != 0 && height != 0 && super::decoder(format.0 as u32).is_some())
+        .then_some((width, height, format))
 }
 
 fn family(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
@@ -53,29 +55,46 @@ fn compatible(source: &ID3D12Resource, back: &ID3D12Resource) -> bool {
         && (s.Width, s.Height, family(s.Format)) == (b.Width, b.Height, family(b.Format))
 }
 
+/// The most targets a present probes.
+const KEPT: usize = 16;
+
+/// A matching target: the title resource (as traces and target dumps name
+/// it) and its host copy.
+pub(crate) type Target = (usize, Arc<HostTexture>);
+
 pub(crate) struct Selection {
-    spec: Spec,
-    last: Mutex<Option<Arc<HostTexture>>>,
+    specs: Vec<Spec>,
+    /// Distinct matching targets since the last present, least recently
+    /// noted first (at most [`KEPT`]).
+    noted: Mutex<Vec<Target>>,
 }
 
 impl Selection {
-    fn new(spec: Spec) -> Self {
+    fn new(specs: Vec<Spec>) -> Self {
         Self {
-            spec,
-            last: Mutex::new(None),
+            specs,
+            noted: Mutex::new(Vec::new()),
         }
     }
 
-    fn note(&self, target: Arc<HostTexture>) {
+    fn note(&self, resource: usize, target: Arc<HostTexture>) {
         // SAFETY: the Arc keeps the texture live.
         let desc = unsafe { target.texture.GetDesc() };
-        if sample_shape(&desc) && (desc.Width, desc.Height, desc.Format) == self.spec {
-            *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && desc.SampleDesc.Count == 1
+            && self.specs.contains(&(desc.Width, desc.Height, desc.Format))
+        {
+            let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+            noted.retain(|(_, t)| !Arc::ptr_eq(t, &target));
+            if noted.len() == KEPT {
+                noted.remove(0);
+            }
+            noted.push((resource, target));
         }
     }
 
-    pub(crate) fn take(&self) -> Option<Arc<HostTexture>> {
-        self.last.lock().unwrap_or_else(|e| e.into_inner()).take()
+    pub(crate) fn take(&self) -> Vec<Target> {
+        std::mem::take(&mut *self.noted.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -84,13 +103,14 @@ pub(crate) fn config() -> Option<&'static Selection> {
     SELECTION
         .get_or_init(|| {
             let value = std::env::var_os("VICTORY_PRESENT_COMPARE")?;
-            let spec = value.to_str().and_then(parse_spec);
-            if spec.is_none() {
+            let specs: Option<Vec<Spec>> =
+                value.to_str().and_then(|v| v.split(',').map(parse_spec).collect());
+            if specs.is_none() {
                 tracing::warn!(
-                    "VICTORY_PRESENT_COMPARE expects <width>x<height>-f<8-bit DXGI format>"
+                    "VICTORY_PRESENT_COMPARE expects <width>x<height>-f<DXGI format>,                      comma-separated"
                 );
             }
-            spec.map(Selection::new)
+            specs.map(Selection::new)
         })
         .as_ref()
 }
@@ -99,20 +119,21 @@ pub(super) fn note_target(resource: crate::object::This) {
     if let Some(selection) = config()
         && let Some(target) = crate::resource::host_copy(resource)
     {
-        selection.note(target);
+        selection.note(resource as usize, target);
     }
 }
 
-/// Uses the last matching target if it can be copied into this back buffer.
+/// Uses the last matching target that can be copied into this back buffer.
+/// Every one is probed either way ([`report_target`]).
 pub(crate) fn source<'a>(
-    selected: Option<&'a HostTexture>,
+    selected: &'a [Target],
     original: &'a ID3D12Resource,
     back: &ID3D12Resource,
 ) -> (&'a ID3D12Resource, &'static str) {
-    match selected {
-        Some(target) if compatible(&target.texture, back) => (&target.texture, "copied"),
-        Some(_) => (original, "incompatible"),
-        None => (original, "not_observed"),
+    match selected.iter().rev().find(|(_, t)| compatible(&t.texture, back)) {
+        Some((_, target)) => (&target.texture, "copied"),
+        None if selected.is_empty() => (original, "not_observed"),
+        None => (original, "not_copied"),
     }
 }
 
@@ -151,6 +172,32 @@ fn probe_back(
         list.ResourceBarrier(&[crate::host::transition(back, src, dest)]);
         buffer
     }
+}
+
+/// Logs a matching target probed in the same list as the present: its
+/// largest sampled channel at full scale 1 (floats as they are), and how
+/// many of the samples have a channel above 5/255. `None`: not read back.
+pub(crate) fn report_target(present_id: u64, index: usize, target: &Target, probe: Option<&ID3D12Resource>) {
+    let (resource, texture) = target;
+    // SAFETY: the Arc keeps the texture live.
+    let d = unsafe { texture.texture.GetDesc() };
+    let values = probe.and_then(|b| super::probe_values(b, d.Format.0 as u32));
+    let peak = values
+        .as_ref()
+        .map(|v| v.iter().flatten().copied().fold(0.0f32, f32::max));
+    let lit = values
+        .as_ref()
+        .map(|v| v.iter().filter(|p| p.iter().any(|&c| c > 5.0 / 255.0)).count());
+    tracing::info!(
+        present_id,
+        index,
+        resource = format_args!("{resource:#x}"),
+        target = format_args!("{}x{}-f{}", d.Width, d.Height, d.Format.0),
+        ?peak,
+        ?lit,
+        samples = super::GRID * super::GRID,
+        "present comparison target"
+    );
 }
 
 pub(crate) fn report(

@@ -1592,7 +1592,7 @@ impl Host {
         let comparison = crate::capture::compare::config();
         // Consume this present's selection even when the presenter cannot show it.
         #[cfg(feature = "diagnostics")]
-        let selected = comparison.and_then(crate::capture::compare::Selection::take);
+        let selected = comparison.map_or_else(Vec::new, crate::capture::compare::Selection::take);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1635,8 +1635,7 @@ impl Host {
             p.copy.reset();
             let list = &p.copy.list;
             #[cfg(feature = "diagnostics")]
-            let (source, selection) =
-                crate::capture::compare::source(selected.as_deref(), texture, &back);
+            let (source, selection) = crate::capture::compare::source(&selected, texture, &back);
             #[cfg(not(feature = "diagnostics"))]
             let source = texture;
             let src = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1648,8 +1647,12 @@ impl Host {
             let use_prelude = source != texture;
             #[cfg(not(feature = "diagnostics"))]
             let use_prelude = false;
+            // Selected targets other than the presented one (the copied
+            // source among them) are probed in this list, in COPY_SOURCE.
             #[cfg(feature = "diagnostics")]
-            if use_prelude && let Some(target) = selected.as_ref() {
+            let probed: Vec<_> = selected.iter().filter(|(_, t)| t.texture != *texture).collect();
+            #[cfg(feature = "diagnostics")]
+            for (_, target) in &probed {
                 p.copy.states.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     std::sync::Arc::as_ptr(target) as usize,
                     (src.0 as u32, src.0 as u32, target.clone()),
@@ -1671,6 +1674,11 @@ impl Host {
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = crate::capture::probe(&self.device, list, source);
+            #[cfg(feature = "diagnostics")]
+            let target_probes: Vec<_> = probed
+                .iter()
+                .map(|(_, t)| crate::capture::probe_any(&self.device, list, &t.texture))
+                .collect();
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if !use_prelude && state != src {
@@ -1680,9 +1688,7 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            if use_prelude {
-                p.copy.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            }
+            p.copy.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -1690,18 +1696,22 @@ impl Host {
             let _result = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            {
+            let black = {
                 let level = if comparison.is_some() {
+                    for (i, (target, buffer)) in probed.iter().zip(&target_probes).enumerate() {
+                        crate::capture::compare::report_target(frame, i, target, buffer.as_ref());
+                    }
                     crate::capture::compare::report(
                         frame, index, selection, _result, probe.as_ref(), back_probe.as_ref(),
                     )
                 } else {
                     probe.as_ref().and_then(crate::capture::probe_level)
                 };
-                return Some(level.is_some_and(crate::capture::record_level));
-            }
+                level.is_some_and(crate::capture::record_level)
+            };
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            let black = false;
+            Some(black)
         }
     }
 

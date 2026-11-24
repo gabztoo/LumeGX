@@ -274,6 +274,29 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
+        // SAFETY: the title passes `planes` plane descriptions.
+        let first = (planes > 0).then_some(unsafe { plane_parameters.as_ref() }).flatten();
+        let resources: Vec<String> = first
+            .filter(|p| !p.resources.is_null())
+            .map(|p| {
+                // SAFETY: the plane lists `count` resources.
+                unsafe { std::slice::from_raw_parts(p.resources, p.count as usize) }
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|&r| match crate::resource::host_resource(r) {
+                Some(t) => {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{r:?} {}x{} f{}", d.Width, d.Height, d.Format.0)
+                }
+                None => format!("{r:?} no host texture"),
+            })
+            .collect();
+        // Only the first plane's first resource is shown; the plane
+        // description's full size is not known, so later planes are counted,
+        // not read.
+        tracing::info!(frame, planes, first_plane = ?resources, "present planes");
     }
     #[cfg(windows)]
     if planes > 0
