@@ -53,6 +53,13 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // The host's wave width picks the form of a console wave64
+                // program (`set_host_max_wave`): entries made on the
+                // software adapter must not serve the hardware one.
+                bytes.extend_from_slice(&victory_shader::emit::host_max_wave().to_le_bytes());
+                // `VICTORY_WAVE_WHY` only logs, at translation: keyed so
+                // that a run with it translates.
+                bytes.push(u8::from(victory_shader::emit::wave_why()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

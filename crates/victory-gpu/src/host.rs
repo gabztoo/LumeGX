@@ -184,6 +184,26 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // The widest wave the GPU runs: at 32 (NVIDIA) console wave64
+        // compute programs whose cross-lane code stays in 32-lane halves
+        // are translated for waves of 32 instead of declaring a wave size
+        // the host refuses.
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+            .is_ok()
+        {
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                "host wave lanes"
+            );
+            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
