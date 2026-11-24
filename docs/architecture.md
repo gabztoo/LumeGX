@@ -94,6 +94,9 @@ waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
 the lanes take, from structurisation), and accessed with a non-uniform heap
-index in one pass. `victory translate`
+index in one pass. A compute root signature with more user data than the
+16 user SGPRs starts at user-data dword 16: the console passes the address
+of a table holding dwords 16 on in s[0:1], and loads from it are tracked as
+the user data they read. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.

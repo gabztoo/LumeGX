@@ -158,24 +158,6 @@ macro_rules! once {
     }};
 }
 
-/// The host address of a root UAV: its buffer's host copy, which shaders
-/// must be able to write, copied in before and back to title memory after,
-/// as an unordered access view's range is.
-/// shortcut: a root view has no size; the range is taken as 1 MiB (cut at
-/// its buffer's end), as a root SRV's is.
-fn root_uav(list: &HostList, address: u64) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("a root UAV whose host copy shaders cannot write");
-        return None;
-    }
-    let len = shadow.left(address).min(1 << 20);
-    shadow.refresh(list, address, len);
-    shadow.gpu_writes(list, address, len);
-    Some(shadow.gpu(address))
-}
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
@@ -523,28 +505,43 @@ impl State {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        self.table_failed |= kind == UAV;
                         continue;
                     };
-                    let gpu = if kind == UAV {
-                        root_uav(list, *address)
-                    } else {
-                        root_view(list, *address, kind == SRV)
-                    };
-                    let Some(gpu) = gpu else {
+                    if kind == UAV {
+                        // A bounded view in a dynamic slot; without one the
+                        // shader would write through an unbound root
+                        // parameter, so the draw or dispatch is dropped.
+                        match self.root_uav(list, *address) {
+                            // SAFETY: an open list; the slot views live memory.
+                            Some(table) => unsafe {
+                                if compute {
+                                    l.SetComputeRootDescriptorTable(param, table);
+                                } else {
+                                    l.SetGraphicsRootDescriptorTable(param, table);
+                                }
+                            },
+                            None => self.table_failed = true,
+                        }
+                        continue;
+                    }
+                    let Some(gpu) = root_view(list, *address, kind == SRV) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, kind) {
                             (false, CBV) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, SRV) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (false, _) => l.SetGraphicsRootShaderResourceView(param, gpu),
                             (true, CBV) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, SRV) => l.SetComputeRootShaderResourceView(param, gpu),
-                            (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                            (true, _) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
                 }
+            }
+            if self.table_failed {
+                once!("a draw or dispatch dropped: a root UAV could not be bound");
+                return false;
             }
         }
         true
@@ -655,6 +652,46 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A root UAV at title address `address`, as a raw unordered access view
+    /// of its buffer's host copy in a dynamic slot of the bound view heap
+    /// (the root parameter is a table of it): bounded by the copy's end,
+    /// where a root view has no bounds and a write past it faults the GPU.
+    /// The range is copied in before and back to title memory after, as a
+    /// table's unordered access view is. `None` if it cannot be made.
+    /// shortcut: a root view has no size; 1 MiB is copied (cut at the
+    /// buffer's end), as for a root SRV, while the view spans the rest of
+    /// the buffer; what shaders write past 1 MiB stays in the host copy.
+    fn root_uav(&mut self, list: &HostList, address: u64) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let shadow = crate::shadow::find(address, 1)?;
+        // SAFETY: a live buffer.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            once!("a root UAV whose host copy shaders cannot write");
+            return None;
+        }
+        // Raw views start on 16 bytes; one starting below the address would
+        // shift every access the shader makes from it.
+        // shortcut: such a root UAV is not bound (its draw or dispatch is
+        // dropped); pass the start's misalignment to the shader to add to
+        // its offsets if those passes matter.
+        let offset = shadow.offset(address);
+        if offset % 16 != 0 {
+            once!(offset, "a root UAV not on 16 bytes of its host copy");
+            return None;
+        }
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
+        let host = heap.host()?;
+        let index = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+        let left = shadow.left(address);
+        let elements = u32::try_from(left / 4).unwrap_or(u32::MAX);
+        host.raw_uav_at(index, &shadow.buffer, offset / 4, elements);
+        let len = left.min(1 << 20);
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        Some(host.gpu(index))
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
