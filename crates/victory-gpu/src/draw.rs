@@ -158,6 +158,25 @@ macro_rules! once {
     }};
 }
 
+/// The host address of a root UAV: its buffer's host copy, which shaders
+/// must be able to write, copied in before and back to title memory after,
+/// as an unordered access view's range is.
+/// shortcut: a root view has no size; the range is taken as 1 MiB (cut at
+/// its buffer's end), as a root SRV's is.
+fn root_uav(list: &HostList, address: u64) -> Option<u64> {
+    let shadow = crate::shadow::find(address, 1)?;
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        once!("a root UAV whose host copy shaders cannot write");
+        return None;
+    }
+    let len = shadow.left(address).min(1 << 20);
+    shadow.refresh(list, address, len);
+    shadow.gpu_writes(list, address, len);
+    Some(shadow.gpu(address))
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -491,23 +510,38 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            const CBV: u8 = 0;
+            const SRV: u8 = 1;
+            const UAV: u8 = 2;
+            let views = [
+                (&stage.root_cbvs, CBV),
+                (&stage.root_srvs, SRV),
+                (&stage.root_uavs, UAV),
+            ];
+            for (views, kind) in views {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let gpu = if kind == UAV {
+                        root_uav(list, *address)
+                    } else {
+                        root_view(list, *address, kind == SRV)
+                    };
+                    let Some(gpu) = gpu else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, CBV) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                            (false, SRV) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (true, CBV) => l.SetComputeRootConstantBufferView(param, gpu),
+                            (true, SRV) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
                         }
                     }
                 }
@@ -586,7 +620,8 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            let views = stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs);
+            for &(slot, _) in views {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -838,7 +873,10 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return vec!["no host pipeline".into()];
+            return vec![format!(
+                "no host pipeline: {}",
+                crate::pipeline::missing(self.pipeline as This)
+            )];
         };
         let mut out = Vec::new();
         for stage in &p.stages {
@@ -991,6 +1029,25 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        signature: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.run_indirect(list, signature, arguments, count);
+        // Traced once its tables are bound, as a dispatch is.
+        #[cfg(feature = "diagnostics")]
+        {
+            let (kind, _, max) = signature;
+            let what = || format!("indirect kind {kind} max {max}{}", if ran { "" } else { " DROPPED" });
+            self.trace(what, kind == 2);
+        }
+        ran
+    }
+
+    /// [`State::execute_indirect`] on the host; false if it was dropped.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),

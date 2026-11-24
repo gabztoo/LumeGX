@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -901,11 +902,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2163,6 +2166,18 @@ impl<'a> Lower<'a> {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
+            } else if let Some((bits, signed)) = sub_dword(rest) {
+                // The dword holding it, shifted down (LDS bytes are little
+                // endian), then zero- or sign-extended.
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let c = self.cur;
+                let p = dword(self, offset);
+                let word = self.s.m.load(c, p);
+                let shift = self.byte_shift(a, offset);
+                let x = self.s.m.bin(c, Bin::LShr, word, shift);
+                let x = self.extend(x, bits, signed);
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
             } else {
                 return Err("an LDS read of bytes or halves");
             };
@@ -2183,6 +2198,31 @@ impl<'a> Lower<'a> {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
+            } else if let Some(bits) = match rest {
+                "_b8" => Some(8),
+                "_b16" => Some(16),
+                _ => None,
+            } {
+                // Only its bits of the dword holding it change: other lanes
+                // may write the dword's other bytes at the same time, so the
+                // bits are cleared and set with two atomics, each touching
+                // only them.
+                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let c = self.cur;
+                let p = dword(self, offset);
+                let shift = self.byte_shift(a, offset);
+                let ones = self.s.m.i32((1u32 << bits) - 1);
+                let mask = self.s.m.bin(c, Bin::Shl, ones, shift);
+                let all = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+                let x = self.s.m.bin(c, Bin::And, x, ones);
+                let x = self.s.m.bin(c, Bin::Shl, x, shift);
+                use super::bitcode::Rmw;
+                let at = self.begin_guarded(guard);
+                self.s.m.atomic(self.cur, Rmw::And, p, keep);
+                self.s.m.atomic(self.cur, Rmw::Or, p, x);
+                self.end_guarded(at, &[]);
+                return Ok(());
             } else {
                 return Err("an LDS write of bytes or halves");
             };
@@ -2809,6 +2849,11 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        // A load from the user-data table: root-parameter dwords, read where
+        // used (`params`).
+        if self.x.res.user_loads.contains(&site) {
+            return Ok(());
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -3362,6 +3407,13 @@ impl<'a> Lower<'a> {
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
+                    }
+                    // Graphics stages other than pixel would need UAVs at
+                    // every stage.
+                    (RootType::Descriptor, Some(ResourceType::Uav), 0x100B)
+                        if matches!(self.x.native.stage, HwStage::Cs | HwStage::Ps) =>
+                    {
+                        Ok(self.s.root_uav_handle(rp.slot))
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
@@ -6149,6 +6201,29 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The bit shift of the byte at `address + offset` in its dword.
+    fn byte_shift(&mut self, address: V, offset: u32) -> V {
+        let c = self.cur;
+        let o = self.s.m.i32(offset);
+        let at = self.s.m.bin(c, Bin::Add, address, o);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
+        self.s.m.bin(c, Bin::Shl, byte, three)
+    }
+
+    /// The low `bits` of `x`, zero- or sign-extended.
+    fn extend(&mut self, x: V, bits: u32, signed: bool) -> V {
+        let c = self.cur;
+        if signed {
+            let k = self.s.m.i32(32 - bits);
+            let up = self.s.m.bin(c, Bin::Shl, x, k);
+            self.s.m.bin(c, Bin::AShr, up, k)
+        } else {
+            let ones = self.s.m.i32((1u32 << bits) - 1);
+            self.s.m.bin(c, Bin::And, x, ones)
+        }
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -6202,6 +6277,8 @@ impl<'a> Lower<'a> {
         {
             _ if atomic.is_some() => (false, 1),
             Some("dword") => (false, 1),
+            Some(n) if !store && sub_dword(&format!("_{n}")).is_some() => (false, 1),
+            Some(n) if store && sub_store(n).is_some() => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
             Some("dwordx4") => (false, 4),
@@ -6272,6 +6349,85 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        if let Some((bits, high)) = name.strip_prefix("buffer_store_").and_then(sub_store) {
+            // Only its bits of the dword holding it change: other lanes may
+            // write the dword's other bytes, so the bits are cleared and set
+            // with two atomics, each touching only them.
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let mut x = self.vgprs(inst, d, 1)?[0];
+            if high {
+                let k16 = self.s.m.i32(16);
+                x = self.s.m.bin(c, Bin::LShr, x, k16);
+            }
+            let not3 = self.s.m.i32(!3);
+            let aligned = self.s.m.bin(c, Bin::And, off, not3);
+            let shift = self.byte_shift(off, 0);
+            let ones = self.s.m.i32((1u32 << bits) - 1);
+            let mask = self.s.m.bin(c, Bin::Shl, ones, shift);
+            let all = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+            let x = self.s.m.bin(c, Bin::And, x, ones);
+            let x = self.s.m.bin(c, Bin::Shl, x, shift);
+            let (h, coords) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | 0x1000, stride))?;
+                    (h, [index, aligned, iu])
+                }
+                None => (self.handle(site, src, false, (11 | 0x1000, 0))?, [aligned, iu, iu]),
+            };
+            let at = self.begin_guarded(guard);
+            let i32t = self.s.t.i32;
+            // DXIL atomic operations 1 and 2: and, or.
+            for (op, value) in [(1, keep), (2, x)] {
+                let mut args = vec![h, self.s.m.i32(op)];
+                args.extend(coords);
+                args.push(value);
+                self.s
+                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
+        let sub = name.strip_prefix("buffer_load").and_then(sub_dword);
+        if let Some((bits, signed)) = sub {
+            // Raw buffers load whole dwords: the one holding it, shifted
+            // down, then zero- or sign-extended.
+            let not3 = self.s.m.i32(!3);
+            let aligned = self.s.m.bin(c, Bin::And, off, not3);
+            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+            let r = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let args = [h, index, aligned, mask, align];
+                    self.s
+                        .op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &args)
+                }
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let args = [h, aligned, iu, mask, align];
+                    self.s
+                        .op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &args)
+                }
+            };
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let word = self.s.m.extract(c, r, 0);
+            let word = self.as_int(word);
+            let shift = self.byte_shift(off, 0);
+            let x = self.s.m.bin(c, Bin::LShr, word, shift);
+            let x = self.extend(x, bits, signed);
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -6945,6 +7101,30 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Bits of a byte or half store (`byte`, `short`), and whether it stores
+/// the data's high half (`_d16_hi`).
+fn sub_store(rest: &str) -> Option<(u32, bool)> {
+    Some(match rest {
+        "byte" => (8, false),
+        "short" => (16, false),
+        "byte_d16_hi" => (8, true),
+        "short_d16_hi" => (16, true),
+        _ => return None,
+    })
+}
+
+/// Bits and signedness of a byte or half load (`_u8`, `_i16`, `_ubyte`,
+/// `_sshort`...), from the end of its name.
+fn sub_dword(rest: &str) -> Option<(u32, bool)> {
+    Some(match rest {
+        "_u8" | "_ubyte" => (8, false),
+        "_i8" | "_sbyte" => (8, true),
+        "_u16" | "_ushort" => (16, false),
+        "_i16" | "_sshort" => (16, true),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
@@ -7419,3 +7599,4 @@ mod tests {
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
 }
+

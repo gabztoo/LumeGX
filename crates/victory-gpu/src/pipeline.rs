@@ -116,12 +116,16 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        dump_untranslated(self);
+                    }
                 }
                 done.ok()
             })
@@ -269,6 +273,17 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+/// Why `this` has no host pipeline, as the drop counts name it: a shader
+/// that does not translate, a pipeline the host refused, or one being made
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn missing(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline set".into();
+    }
+    make::missing(&pipeline(this).host).unwrap_or_default()
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -501,6 +516,29 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// Where containers that do not translate are written (diagnostics, with
+/// `VICTORY_SHADER_DUMP`): a folder of the cache, outside the repository.
+#[cfg(all(windows, feature = "diagnostics"))]
+static UNTRANSLATED: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Writes containers that do not translate to `dir`, as
+/// `<stage>-<hash>.dxbc`, for `victory shader-info --disasm` (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn dump_untranslated_to(dir: std::path::PathBuf) {
+    let _ = UNTRANSLATED.set(dir);
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_untranslated(shader: &Shader) {
+    let Some(dir) = UNTRANSLATED.get() else { return };
+    let path = dir.join(format!("{}-{}.dxbc", shader.stage, shader.hash));
+    if !path.exists()
+        && let Err(e) = std::fs::write(&path, &shader.container[..])
+    {
+        tracing::warn!(error = %e, path = %path.display(), "shader not dumped");
+    }
 }
 
 #[cfg(test)]
