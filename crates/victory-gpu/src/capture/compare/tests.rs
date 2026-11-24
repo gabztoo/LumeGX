@@ -76,7 +76,7 @@ fn present_compare_copies_the_last_matching_black_target() {
     let black = texture(host, 8, rt);
     let other = texture(host, 4, rt);
     let back = texture(host, 8, rt);
-    let selection = Selection::new((8, 4, DXGI_FORMAT_R8G8B8A8_UNORM));
+    let selection = Selection::new(vec![(8, 4, DXGI_FORMAT_R8G8B8A8_UNORM)]);
     selection.note(1, bright.clone());
     selection.note(2, black.clone());
     selection.note(3, other.clone());
@@ -140,7 +140,7 @@ fn present_compare_probes_a_scene_target_of_another_size() {
     let scene = texture_in(host, 4, float, rt);
     let unlit = texture_in(host, 4, float, rt);
     let output = texture(host, 8, rt);
-    let selection = Selection::new((4, 4, float));
+    let selection = Selection::new(vec![(4, 4, float), (2, 2, float)]);
     selection.note(7, scene.clone());
     selection.note(8, unlit.clone());
     selection.note(9, output.clone());

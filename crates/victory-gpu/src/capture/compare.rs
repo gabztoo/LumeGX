@@ -56,23 +56,23 @@ fn compatible(source: &ID3D12Resource, back: &ID3D12Resource) -> bool {
 }
 
 /// The most targets a present probes.
-const KEPT: usize = 8;
+const KEPT: usize = 16;
 
 /// A matching target: the title resource (as traces and target dumps name
 /// it) and its host copy.
 pub(crate) type Target = (usize, Arc<HostTexture>);
 
 pub(crate) struct Selection {
-    spec: Spec,
+    specs: Vec<Spec>,
     /// Distinct matching targets since the last present, least recently
     /// noted first (at most [`KEPT`]).
     noted: Mutex<Vec<Target>>,
 }
 
 impl Selection {
-    fn new(spec: Spec) -> Self {
+    fn new(specs: Vec<Spec>) -> Self {
         Self {
-            spec,
+            specs,
             noted: Mutex::new(Vec::new()),
         }
     }
@@ -82,7 +82,7 @@ impl Selection {
         let desc = unsafe { target.texture.GetDesc() };
         if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
             && desc.SampleDesc.Count == 1
-            && (desc.Width, desc.Height, desc.Format) == self.spec
+            && self.specs.contains(&(desc.Width, desc.Height, desc.Format))
         {
             let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
             noted.retain(|(_, t)| !Arc::ptr_eq(t, &target));
@@ -103,13 +103,14 @@ pub(crate) fn config() -> Option<&'static Selection> {
     SELECTION
         .get_or_init(|| {
             let value = std::env::var_os("VICTORY_PRESENT_COMPARE")?;
-            let spec = value.to_str().and_then(parse_spec);
-            if spec.is_none() {
+            let specs: Option<Vec<Spec>> =
+                value.to_str().and_then(|v| v.split(',').map(parse_spec).collect());
+            if specs.is_none() {
                 tracing::warn!(
-                    "VICTORY_PRESENT_COMPARE expects <width>x<height>-f<8-bit DXGI format>"
+                    "VICTORY_PRESENT_COMPARE expects <width>x<height>-f<DXGI format>,                      comma-separated"
                 );
             }
-            spec.map(Selection::new)
+            specs.map(Selection::new)
         })
         .as_ref()
 }

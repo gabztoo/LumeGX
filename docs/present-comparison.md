@@ -1,10 +1,11 @@
 # Compare selected targets with the presented image
 
 In a Windows build with `diagnostics`, set `VICTORY_PRESENT_COMPARE` to
-`<width>x<height>-f<DXGI format number>`, for example `2560x1440-f28` for an
-RGBA8 UNORM target or `2560x1440-f10` for an RGBA16 float one. For each host
-present, the distinct matching targets observed while recording render-target
-or UAV bindings since the previous present (the last eight) are selected.
+`<width>x<height>-f<DXGI format number>` (several, comma-separated), for
+example `2560x1440-f28` for an RGBA8 UNORM target or `2560x1440-f10` for an
+RGBA16 float one. For each host present, the distinct matching targets
+observed while recording render-target or UAV bindings since the previous
+present (the last sixteen) are selected.
 Selection is by the host texture descriptor, not a resource address or shader
 identity. It does not prove the resource was written.
 
