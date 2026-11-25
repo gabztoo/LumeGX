@@ -29,6 +29,12 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
+//! * **Constant buffers in tables and the heap.** A constant buffer read
+//!   through a table, by scalar or per-lane loads, or through the resource
+//!   heap itself (root type 5) is read as a raw buffer: the host makes a raw
+//!   shader resource view of the buffer's host copy in the title's slot,
+//!   since the console needs 16-byte alignment and a host constant buffer
+//!   view 256. A table holding one is not copied per draw.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,

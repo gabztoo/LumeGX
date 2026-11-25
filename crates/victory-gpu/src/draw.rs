@@ -127,6 +127,13 @@ pub(crate) fn take_past_mirrored() -> u64 {
 }
 static PAST_MIRRORED: AtomicU64 = AtomicU64::new(0);
 
+/// Tables made afresh in dynamic slots (once per list and contents), since
+/// the last call.
+pub(crate) fn take_fresh_made() -> u64 {
+    FRESH_MADE.swap(0, Ordering::Relaxed)
+}
+static FRESH_MADE: AtomicU64 = AtomicU64::new(0);
+
 /// Draws, mesh dispatches and dispatches dropped because a dynamic table of
 /// theirs was refused, since the last call.
 pub(crate) fn take_table_drops() -> u64 {
@@ -746,27 +753,23 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// The descriptors a shader reads through tables, made from the title's
+    /// slots. A constant buffer is one of them: its slot is a raw view of
+    /// its buffer's host copy, which translated shaders read (the host wants
+    /// constant buffer views 256-byte aligned, the console only 16). Tables
+    /// reaching past the slots a capped host heap mirrors are made afresh
+    /// for the draw in dynamic slots; returns those tables' new byte offsets
+    /// by root parameter.
     ///
     /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// afresh once: the big tables the world binds would otherwise take
+    /// hundreds of slots per draw, wrapping the dynamic slots onto lists not
+    /// yet submitted.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
+        // host's limit, 1,000,000 views on NVIDIA) are made afresh: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
@@ -792,6 +795,40 @@ impl State {
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
+            }
+        }
+        // A table holding a constant buffer used to be made afresh whole,
+        // from its first used entry to its last: a shader may index a
+        // descriptor array between the entries its used-resource list names.
+        // Those title slots are brought up to date too, each as the named
+        // entry below it (the array's first).
+        let mut slots: Vec<u8> = used
+            .iter()
+            .filter(tables)
+            .filter(|u| u.kind == ResourceType::Cbv && !fresh.contains(&u.slot))
+            .map(|u| u.slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            let mut named: Vec<&UsedResource> =
+                used.iter().filter(tables).filter(|u| u.slot == slot).collect();
+            named.sort_by_key(|u| u.table_offset_dwords / 8);
+            let (Some(&&low), Some(&&high)) = (named.first(), named.last()) else {
+                continue;
+            };
+            for k in low.table_offset_dwords / 8 + 1..high.table_offset_dwords / 8 {
+                if named.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    continue;
+                }
+                let Some(&&below) = named.iter().rev().find(|u| u.table_offset_dwords / 8 < k) else {
+                    continue;
+                };
+                let entry = UsedResource {
+                    table_offset_dwords: k * 8,
+                    ..below
+                };
+                self.table_entry(list, &entry, compute);
             }
         }
         let mut made = Vec::new();
@@ -828,7 +865,7 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&base) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in &entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         // Entry `k` of a trimmed table lies at `base + k`.
@@ -840,14 +877,14 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
-                // Without its fresh table the shader would read the title's
-                // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
+                // Without its fresh table the shader would read past the
+                // host heap's mirrored slots, which hold other tables' views
+                // or none: a wild descriptor can remove the device (#59).
                 // The draw or dispatch is dropped instead.
                 self.table_failed = true;
                 continue;
             };
+            FRESH_MADE.fetch_add(1, Ordering::Relaxed);
             let base = first - start;
             self.fresh_tables.insert(key, base);
             self.dynamic
@@ -858,14 +895,6 @@ impl State {
                 let index = base + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
                     Some(view) => {
                         let copy = host.make_at(index, &view);
                         if let Some(u) = used {

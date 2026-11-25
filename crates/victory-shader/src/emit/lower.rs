@@ -3313,15 +3313,31 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let Some(u) = kind
-            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        // Constant data in a table, or through the resource heap itself, is
+        // read from a raw view of its buffer that the host makes in the
+        // title's slot (module notes, "Constant buffers in tables and the
+        // heap"): the host's constant buffer views need 256-byte alignment,
+        // the title's 16.
+        // A table entry the used-resource list does not name holds what the
+        // title wrote there, a constant buffer's raw view included.
+        let raw_constants = match kind {
+            Some(u) => u.kind == ResourceType::Cbv && u.root == RootType::Table,
+            None => self.is_heap_direct(src) || self.is_from_table(src),
+        };
+        if raw_constants
+            || kind.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
         {
-            let uav = if u.kind == ResourceType::Uav {
+            let uav = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
                 0x1000
             } else {
                 0
             };
-            let stride = structured_stride(kind);
+            // A raw view has no stride, whatever a constant entry names.
+            let stride = if raw_constants {
+                None
+            } else {
+                structured_stride(kind)
+            };
             let props = match stride {
                 Some(s) => (12 | uav, s),
                 None => (11 | uav, 0),
@@ -3745,6 +3761,30 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        self.comes_from(src, RootType::ResourceHeap)
+    }
+
+    /// Whether a descriptor is loaded from a descriptor table on some path.
+    fn is_from_table(&self, src: &Source) -> bool {
+        self.comes_from(src, RootType::Table)
+    }
+
+    /// Whether a descriptor is loaded through a root parameter of type `root`
+    /// on some path.
+    fn comes_from(&self, src: &Source, root: RootType) -> bool {
+        src.leaves().iter().any(|l| match l {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == root),
+            _ => false,
+        })
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src
@@ -6788,7 +6828,6 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -6800,6 +6839,29 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if used.is_some_and(|u| u.root == RootType::Table) {
+                // A table's constant buffer is a raw view (scalar loads above).
+                let h = self.handle(site, src, false, (11, 0))?;
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                    let iu = self.s.m.undef(self.s.t.i32);
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, iu, mask, al],
+                    );
+                    let x = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
