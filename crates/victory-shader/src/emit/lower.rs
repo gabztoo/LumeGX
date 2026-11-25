@@ -6163,9 +6163,30 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    if self.s.pixel {
+                        args.push(fu);
+                        self.s
+                            .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    } else {
+                        // Outside a pixel shader there are no screen
+                        // derivatives: the validator refuses `sample` there
+                        // ("features incompatible with the shader stage";
+                        // 730 compute programs in the fork's census, among
+                        // them the G-buffer resolves and the sky).
+                        // shortcut: such a sample reads level 0. The console
+                        // takes derivatives from neighbouring lanes there;
+                        // compute them from the lanes if a resolve shows the
+                        // wrong mip.
+                        args.push(self.s.m.f32(0));
+                        self.s.op(
+                            c,
+                            "sampleLevel.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            62,
+                            &args,
+                        )
+                    }
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
