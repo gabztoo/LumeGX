@@ -192,6 +192,37 @@ fn an_implicit_level_sample_in_compute_reads_level_0() {
     }
 }
 
+/// `image_gather4_l` (a gather at a named level) in a compute program: the
+/// host's gather has no level, so the four texels are read at that level.
+/// The sample of [`WATERFALL_JOINED_WAVE32`](crate::resource::tests) made a
+/// red-channel gather at level 0 (`v3`), coordinates in `v1`, `v2`: on 1x1
+/// textures every texel is the texture's one, so each lane gets the red
+/// its arm's texture holds.
+#[test]
+fn a_named_level_gather_in_compute_reads_that_level() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let mut words = Vec::new();
+    for &w in WATERFALL_JOINED_WAVE32 {
+        match w {
+            // v_mov_b32 v3, v2 -> v_mov_b32 v1, v2; v_mov_b32 v3, 0 (before
+            // any branch: the relative branches after it are unchanged)
+            0x7E06_0302 => words.extend([0x7E02_0302, 0x7E06_0280]),
+            // image_sample_lz dmask 0xf -> image_gather4_l (0x44) dmask 1
+            0xF09C_0F08 => words.push(0xF110_0108),
+            // its address from v1 (v1, v2 coordinates, v3 level)
+            0x0043_0C02 => words.push(0x0043_0C01),
+            _ => words.push(w),
+        }
+    }
+    let shader = build(&words, false);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    for (label, red) in results {
+        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
 #[test]
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
