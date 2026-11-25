@@ -1694,6 +1694,10 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
+                // Totals since the last of these lines.
+                for line in crate::stats::take_report() {
+                    tracing::info!("pipeline stats: {line}");
+                }
             }
         }
         if self.caption.is_none() {

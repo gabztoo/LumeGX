@@ -1136,6 +1136,15 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FRAME_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Draws recorded since the last present.
+static FRAME_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`FRAME_DRAWS`], counted again from 0 (at each present).
+pub(crate) fn take_frame_draws() -> u64 {
+    FRAME_DRAWS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and

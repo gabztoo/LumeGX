@@ -99,6 +99,15 @@ impl Shadow {
         address - self.start
     }
 
+    /// Diagnostics: the copy's dword at title address `address` (none
+    /// outside the copy), as the GPU last wrote it once its list ran.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dword(&self, address: u64) -> Option<u32> {
+        let at = address.checked_sub(self.start)?;
+        // SAFETY: inside the mapped copy.
+        (at + 4 <= self.len).then(|| unsafe { self.data.add(at as usize).cast::<u32>().read_unaligned() })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
