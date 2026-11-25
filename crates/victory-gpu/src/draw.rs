@@ -43,6 +43,16 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// The root data sent to the host for one stage of the current draw
+/// (diagnostics, for the device-removed report).
+#[cfg(feature = "diagnostics")]
+struct BoundUserData {
+    values: Vec<u32>,
+    /// Tables made afresh for it: (root slot, offset sent, first and end
+    /// entry made; entry `k` lies at slot `offset / 32 + k`).
+    rebuilt_tables: Vec<(u8, u32, u32, u32)>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -85,6 +95,14 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
     /// The pipeline of the last draw prepared runs the depth bounds test.
     depth_bounds: bool,
+    /// The values sent to each stage for the next device-removed marker.
+    #[cfg(feature = "diagnostics")]
+    bound_user_data: Vec<BoundUserData>,
+    /// Why the draw or dispatch being prepared is dropped where a missing
+    /// pipeline does not say ("" if it is not), noted by
+    /// [`State::drop_for`].
+    #[cfg(feature = "diagnostics")]
+    dropped_why: &'static str,
 }
 
 impl Drop for State {
@@ -170,10 +188,13 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
+/// Marks the last traced draw as not run on the host, and counts why: its
+/// host pipeline missing, else `why`.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+fn dropped(pipeline: usize, why: &str) {
+    if !crate::pipeline::note_drop(pipeline as This) && !why.is_empty() {
+        crate::pipeline::note_why(why.to_owned());
+    }
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -398,6 +419,10 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -406,6 +431,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            self.drop_for("pipeline made, of another kind");
             return false;
         }
         if !self.bind(list, p, false) {
@@ -443,6 +469,13 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                once!(
+                    address = format_args!("{:#x}", v.address),
+                    size = v.size,
+                    left = ?crate::shadow::find(v.address, 1).map(|s| s.left(v.address)),
+                    "an indexed draw whose index buffer is not in a title buffer dropped"
+                );
+                self.drop_for("pipeline made, index buffer not in a title buffer");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -458,6 +491,8 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            #[cfg(feature = "diagnostics")]
+            crate::producers::live_target(t);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
@@ -474,6 +509,16 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
+        #[cfg(feature = "diagnostics")]
+        let record_bindings = crate::host::dred_on();
+        #[cfg(feature = "diagnostics")]
+        if record_bindings {
+            self.bound_user_data.clear();
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -513,6 +558,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::producers::set_reader(&p.name);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -520,6 +567,7 @@ impl State {
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 TABLE_DROPS.fetch_add(1, Ordering::Relaxed);
+                self.drop_for("pipeline made, no dynamic slots for its tables");
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -529,14 +577,15 @@ impl State {
                 }
                 return false;
             }
+            let mut values = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some(&(_, offset, ..)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -548,6 +597,10 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if record_bindings {
+                self.bound_user_data.push(BoundUserData { values, rebuilt_tables: made.clone() });
             }
             const CBV: u8 = 0;
             const SRV: u8 = 1;
@@ -577,7 +630,10 @@ impl State {
                                     l.SetGraphicsRootDescriptorTable(param, table);
                                 }
                             },
-                            None => self.table_failed = true,
+                            None => {
+                                self.table_failed = true;
+                                self.drop_for("pipeline made, root SRV without a view heap or slot");
+                            }
                         }
                         continue;
                     }
@@ -585,6 +641,9 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         self.table_failed |= kind == UAV;
+                        if kind == UAV {
+                            self.drop_for("pipeline made, root UAV the title did not set");
+                        }
                         continue;
                     };
                     if kind == UAV {
@@ -629,6 +688,10 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         let _ran = self.run_dispatch(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        if !_ran {
+            self.note_dropped_writes();
+        }
         // Traced once its tables are bound: compute writes through them.
         #[cfg(feature = "diagnostics")]
         self.trace(
@@ -661,6 +724,10 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if !self.dropped_why.is_empty() {
+                crate::pipeline::note_why(self.dropped_why.to_owned());
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -672,9 +739,10 @@ impl State {
     }
 
     /// What a draw or dispatch runs, for the device-removed report
-    /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (diagnostics): the pipeline, then per stage the user data it was
+    /// bound with (tables by where they are: rebuilt, in which heap and at
+    /// which slot, or unbound), the host addresses of its root views and the
+    /// title tables it reads.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -682,19 +750,11 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
-        let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten();
-        for stage in &p.stages {
+        for (stage, bound) in p.stages.iter().zip(&self.bound_user_data) {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
-                }
+                self.note_user_data(&mut text, compute, u, bound);
             }
             let views = stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs);
             for &(slot, _) in views {
@@ -705,7 +765,7 @@ impl State {
                 }
             }
         }
-        let _ = write!(text, " tables {:?}", self.reads(compute));
+        let _ = write!(text, " title tables {:?}", self.reads(compute));
         text
     }
 
@@ -729,7 +789,61 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
+        }
+    }
+
+    /// Notes why the draw or dispatch being prepared is dropped, for the
+    /// drop counts and [`crate::producers`] (diagnostics builds; the last
+    /// reason noted since preparing began stands).
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables, clippy::unused_self))]
+    fn drop_for(&mut self, why: &'static str) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = why;
+        }
+    }
+
+    /// Diagnostics (`VICTORY_PRODUCERS=1`): what the dropped draw or
+    /// dispatch bound now would have written, for [`crate::producers`].
+    #[cfg(feature = "diagnostics")]
+    fn note_dropped_writes(&self) {
+        if !crate::producers::on() {
+            return;
+        }
+        let why = match self.dropped_why {
+            "" => crate::pipeline::missing(self.pipeline as This),
+            why => why.to_owned(),
+        };
+        let name = |stage: &str, hash: &str| match why.as_str() {
+            "" => format!("{stage} {hash}"),
+            why => format!("{stage} {hash} ({why})"),
+        };
+        let mut writer = String::new();
+        for (stage, hash, used) in crate::pipeline::native_used(self.pipeline as This) {
+            let compute = stage == "compute";
+            if writer.is_empty() || stage == "pixel" || compute {
+                writer = name(stage, hash);
+            }
+            for u in used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(view) = crate::descriptor::view(handle) {
+                    crate::producers::dropped_write(&name(stage, hash), &view);
+                }
+            }
+        }
+        if !writer.starts_with("compute") {
+            for &t in &self.targets {
+                crate::producers::dropped_target(&writer, t);
+            }
         }
     }
 
@@ -743,11 +857,15 @@ impl State {
     /// buffer's end), as for a root SRV, while the view spans the rest of
     /// the buffer; what shaders write past 1 MiB stays in the host copy.
     fn root_uav(&mut self, list: &HostList, address: u64) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
-        let shadow = crate::shadow::find(address, 1)?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            self.drop_for("pipeline made, root UAV not in a title buffer");
+            return None;
+        };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             once!("a root UAV whose host copy shaders cannot write");
+            self.drop_for("pipeline made, root UAV in a copy shaders cannot write");
             return None;
         }
         // Raw views start on 16 bytes; one starting below the address would
@@ -758,11 +876,18 @@ impl State {
         let offset = shadow.offset(address);
         if offset % 16 != 0 {
             once!(offset, "a root UAV not on 16 bytes of its host copy");
+            self.drop_for("pipeline made, root UAV not on 16 bytes of its host copy");
             return None;
         }
-        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
-        let host = heap.host()?;
-        let index = host.dynamic(1)?;
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+            self.drop_for("pipeline made, root UAV with no view heap");
+            return None;
+        };
+        let Some(index) = host.dynamic(1) else {
+            self.drop_for("pipeline made, root UAV without a dynamic slot");
+            return None;
+        };
         self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
         let left = shadow.left(address);
         let elements = u32::try_from(left / 4).unwrap_or(u32::MAX);
@@ -836,6 +961,68 @@ impl State {
         Some(host.gpu(index))
     }
 
+    /// One user-data value as bound, for [`State::op_text`]: a table's by
+    /// where it is (rebuilt for this draw, or the heap and slot it starts
+    /// at, with that slot's host view; for a view the host never made, what
+    /// the title's heap memory holds there).
+    #[cfg(feature = "diagnostics")]
+    fn note_user_data(
+        &self,
+        text: &mut String,
+        compute: bool,
+        data: &victory_shader::emit::UserData,
+        bound: &BoundUserData,
+    ) {
+        use std::fmt::Write;
+        let Some(&value) = bound.values.get(data.index as usize) else {
+            return;
+        };
+        let _ = write!(text, " u{}={value:#x}", data.index);
+        if data.root != RootType::Table {
+            return;
+        }
+        if let Some(&(_, _, start, end)) = bound.rebuilt_tables.iter().find(|r| r.0 == data.slot) {
+            // Rebuilt tables use dynamic view slots, which have no mirror
+            // record. The offset is in 32-byte console view descriptors;
+            // trimmed to entries `start..end` (#1349), they hold only
+            // slots `base + start..base + end`.
+            let base = value / 32;
+            let _ = write!(text, " [rebuilt view table base {base}, slots {}..{}]", base + start, base + end);
+            return;
+        }
+        let table = match self.roots_ref(compute).get(usize::from(data.slot)) {
+            Some(Root::Table(handle)) => self
+                .heap_of(*handle)
+                .and_then(|heap| heap.index(*handle).map(|index| (heap, index))),
+            _ => None,
+        };
+        let Some((heap, index)) = table else {
+            text.push_str(" [unbound table]");
+            return;
+        };
+        let kind = if heap.samplers() { "sampler" } else { "view" };
+        let _ = write!(text, " [{kind} table base {index}");
+        if let Some(record) = heap.host().and_then(|h| h.describe_slot(index)) {
+            let _ = write!(text, ": {record}");
+            // A view the host never made: what the title's memory holds
+            // there (our record, zeros, or words it wrote itself).
+            if record == "null" && !heap.samplers() {
+                let at = heap.start + u64::from(index) * 32;
+                let mut words = [0u8; 32];
+                if crate::host::read_into(at as *const u8, &mut words) {
+                    let w: Vec<u32> =
+                        words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let _ = write!(text, " (title words {w:x?}");
+                    if let Some(view) = crate::descriptor::view(at) {
+                        let _ = write!(text, ": {}", describe(Some(&view)));
+                    }
+                    text.push(')');
+                }
+            }
+        }
+        text.push(']');
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -872,7 +1059,12 @@ impl State {
     /// afresh once: the big tables the world binds would otherwise take
     /// hundreds of slots per draw, wrapping the dynamic slots onto lists not
     /// yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Vec<(u8, u32, u32, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -980,7 +1172,7 @@ impl State {
                         readable(list, u, &view, copy.as_ref());
                     }
                 }
-                made.push((slot, base * 32));
+                made.push((slot, base * 32, start, end));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -1016,7 +1208,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, base * 32));
+            made.push((slot, base * 32, start, end));
         }
         made
     }
@@ -1143,13 +1335,15 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -1173,9 +1367,11 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
+                self.drop_for("pipeline made, rectangle vertices outside their buffer");
                 return false;
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                self.drop_for("pipeline made, no scratch memory for rectangles");
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -1215,6 +1411,7 @@ impl State {
         self.trace(|| format!("indexed {indices} from {first}"), false);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
+            self.drop_for("indexed rectangles");
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
@@ -1230,7 +1427,9 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 }
@@ -1253,6 +1452,9 @@ impl State {
         // Traced once its tables are bound, as a dispatch is.
         #[cfg(feature = "diagnostics")]
         {
+            if !ran {
+                self.note_dropped_writes();
+            }
             let (kind, _, max) = signature;
             let what = || format!("indirect kind {kind} max {max}{}", if ran { "" } else { " DROPPED" });
             self.trace(what, kind == 2);
@@ -1268,6 +1470,10 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1285,6 +1491,7 @@ impl State {
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
+            self.drop_for("indirect arguments outside title buffers");
             return false;
         };
         let counter = match count {
@@ -1292,6 +1499,7 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    self.drop_for("indirect count outside title buffers");
                     return false;
                 }
             },
@@ -1302,6 +1510,7 @@ impl State {
             .flatten()
         else {
             why("no host signature");
+            self.drop_for("no host command signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1311,12 +1520,19 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            self.drop_for("indirect arguments not bounded");
             return false;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        // A rectangle list drawn indirectly: its vertex count is in GPU
+        // memory, so it cannot be expanded to triangles as a draw's is.
+        let rects = matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES;
+        if rects {
+            self.drop_for("a rectangle list drawn indirectly");
+        }
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => !rects && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1328,8 +1544,13 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                None => {
+                    crate::pipeline::note_drop(self.pipeline as This);
+                }
+                Some(p) => why(&format!(
+                    "not run (compute {}, mesh {}): {}",
+                    p.compute, p.mesh, self.dropped_why
+                )),
             }
             return false;
         }
@@ -1406,6 +1627,12 @@ fn readable(
     view: &View,
     copy: Option<&std::sync::Arc<crate::shadow::Shadow>>,
 ) {
+    #[cfg(feature = "diagnostics")]
+    if u.kind == ResourceType::Uav {
+        crate::producers::live_write(view);
+    } else {
+        crate::producers::read(view);
+    }
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1641,5 +1868,28 @@ mod tests {
         assert_eq!(next, first + 4);
         heap.release(first, n);
         heap.release(next, 1);
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod breadcrumb_tests {
+    use super::*;
+    use victory_shader::emit::UserData;
+
+    /// The device-removed report names each user-data value as bound: a
+    /// constant by its value, a table rebuilt for the draw by its fresh
+    /// base, and a table slot the title never set as unbound (not as an
+    /// index into whatever heap is first).
+    #[test]
+    fn breadcrumbs_distinguish_constants_rebuilt_tables_and_missing_tables() {
+        let mut state = State::default();
+        state.set_table(false, 1, 0x1000);
+        let bound = BoundUserData { values: vec![0x1234, 0x8000, 0], rebuilt_tables: vec![(1, 0x8000, 120, 124)] };
+        let mut text = String::new();
+        for (index, root) in [(0, RootType::Constants), (1, RootType::Table), (2, RootType::Table)] {
+            let data = UserData { index, slot: index as u8, root, dword: 0 };
+            state.note_user_data(&mut text, false, &data, &bound);
+        }
+        assert_eq!(text, " u0=0x1234 u1=0x8000 [rebuilt view table base 1024, slots 1144..1148] u2=0x0 [unbound table]");
     }
 }
