@@ -3523,11 +3523,13 @@ impl<'a> Lower<'a> {
                 } else {
                     (11 | u, 0)
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
+                // A constant buffer in a table or the heap is a raw view of
+                // its copy (module notes), so its size reads the same way.
                 (props, None)
             }
+            // A constant buffer read by scalar loads (a raw view, as above):
+            // its record count, dword 2, is its size in bytes.
+            Fields::Smem { .. } if un.starts_with("s_buffer_load") => ((11, 0), None),
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
