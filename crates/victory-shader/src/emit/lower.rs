@@ -535,6 +535,18 @@ fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool,
     Some(meet)
 }
 
+/// `VICTORY_VIEW_STRIDES=1`: buffers read by element with no stride the
+/// shader names are read raw at element × the view's stride from the
+/// host's view-stride table. Off by default: with it, shaders that did not
+/// translate run during loading and the device hung there (RTX 5050, with
+/// and without heap-usage marks), the strides or raw reads of typed and
+/// structured views presumably wrong for some. Part of the translation:
+/// the shader cache keys on it.
+pub fn view_strides() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_STRIDES").is_some_and(|v| v == "1"))
+}
+
 /// Whether translated shaders mark the heap slots they read in the
 /// heap-usage bitmap (`VICTORY_HEAP_USAGE=1`; off by default, where
 /// upstream has it on: see `docs/guia-victory.md`); off, shaders are
@@ -3780,6 +3792,50 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// The byte stride of the buffer view in the heap slot that descriptor
+    /// `src` (loaded from a table or the resource heap itself) names: dword
+    /// `slot` of the host's view-stride table, root SRV
+    /// `t`[`super::shader::VIEW_STRIDES`].
+    fn view_stride(&mut self, src: &Source) -> Result<V, Why> {
+        const WHY: Why = "a structured buffer of unknown stride";
+        let in_heap = |l: &Self, load: &Site| {
+            l.scalar
+                .get(load)
+                .and_then(|a| l.x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table))
+        };
+        let leaves = src.leaves();
+        if leaves.is_empty()
+            || !leaves.iter().all(|l| match l {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => in_heap(self, load),
+                _ => false,
+            })
+        {
+            return Err(WHY);
+        }
+        let index = match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
+            Source::Phi { .. } | Source::Select { .. } => return Err(WHY),
+            _ => self.lane_heap_index(src, false)?,
+        };
+        let c = self.cur;
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(super::shader::VIEW_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, four],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        Ok(self.as_int(x))
+    }
+
     /// Whether a descriptor comes from the resource heap itself (root type
     /// 5, not a table) on some path.
     fn is_heap_direct(&self, src: &Source) -> bool {
@@ -3851,13 +3907,15 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
-        // Texture views read from the heap itself mark their slots in the
-        // heap-usage bitmap (`HostShader::heap_usage`): only placed textures
-        // are made from the marks. Pixel and compute programs only, as for
-        // root UAVs: other graphics stages would need UAVs at every stage.
+        // Texture and buffer views read from the heap itself mark their
+        // slots in the heap-usage bitmap (`HostShader::heap_usage`): the host
+        // makes placed textures and buffer views from the marks. Pixel and
+        // compute programs only, as for root UAVs. (Marks in mesh and
+        // vertex programs, with UAVs at every stage declared, ran: the
+        // title then asserted soon after world entry in 2 runs of 2.)
         let mark = !sampler
             && props.0 & 0x1000 == 0
-            && matches!(props.0 & 0xFF, 1..=9)
+            && matches!(props.0 & 0xFF, 1..=12)
             && matches!(self.x.native.stage, HwStage::Cs | HwStage::Ps)
             && self.is_heap_direct(src)
             && heap_usage_marks();
@@ -6913,6 +6971,29 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        // An element of a buffer whose stride the shader does not name (a
+        // view picked from the heap itself, or a table entry with no
+        // stride): the stride of the view in that slot, from the host's
+        // view-stride table, makes the element's byte offset; then the
+        // buffer is read raw.
+        let index = match index {
+            Some(i)
+                if !typed
+                    && view_strides()
+                    && !used.is_some_and(|u| u.kind == ResourceType::Cbv)
+                    && used.is_none_or(|u| u.stride < 4 || !u.stride.is_multiple_of(4)) =>
+            {
+                match self.view_stride(src) {
+                    Ok(stride) => {
+                        let at = self.s.m.bin(c, Bin::Mul, i, stride);
+                        off = self.s.m.bin(c, Bin::Add, at, off);
+                        None
+                    }
+                    Err(_) => Some(i),
+                }
+            }
+            other => other,
+        };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte

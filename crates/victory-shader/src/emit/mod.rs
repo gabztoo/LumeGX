@@ -35,6 +35,13 @@
 //!   shader resource view of the buffer's host copy in the title's slot,
 //!   since the console needs 16-byte alignment and a host constant buffer
 //!   view 256. A table holding one is not copied per draw.
+//! * **Buffers read by element without a known stride** (a view the shader
+//!   picks from the heap itself, or a table entry whose used-resource entry
+//!   gives no stride): read raw, at element × the view's stride + offset,
+//!   the stride from the host's view-stride table, root SRV
+//!   `t`[`VIEW_STRIDES`] (listed in [`HostShader::root_srvs`]), whose dword
+//!   `i` the host keeps at the byte stride of the buffer view at heap slot
+//!   `i`.
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does, for direct and
@@ -112,9 +119,9 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
-pub use lower::{heap_usage_marks, host_max_wave, set_host_max_wave, wave_split_lds, wave_why};
+pub use lower::{heap_usage_marks, host_max_wave, set_host_max_wave, view_strides, wave_split_lds, wave_why};
 pub use sampler::StaticSampler;
-pub use shader::{HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

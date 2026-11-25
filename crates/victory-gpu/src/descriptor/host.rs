@@ -38,6 +38,37 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, which are taken (by
     /// lists not yet reset), and how many are free.
     next: Mutex<(u32, Vec<bool>, usize)>,
+    /// The buffer views in its title slots that programs picking views
+    /// from the heap itself read ([`HostHeap::heap_buffers`]).
+    buffers: Mutex<HeapBuffers>,
+    /// The title frame its buffers were last brought up to date in.
+    refreshed: std::sync::atomic::AtomicU64,
+    /// View heaps: the view-stride table translated shaders read
+    /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot (at
+    /// least `HEAP_VIEWS`): the byte stride of the buffer view there, 0 for
+    /// none. Mapped at the address kept beside it.
+    strides: Option<(ID3D12Resource, usize)>,
+}
+
+/// A view heap's buffer views by title slot: the copy each views, the
+/// title range, and whether shaders may write it (unordered access); and
+/// those ranges merged per copy and kind while no view changes.
+#[derive(Default)]
+struct HeapBuffers {
+    slots: std::collections::HashMap<u32, HeapBuffer>,
+    hulls: Option<Vec<HeapBuffer>>,
+}
+
+/// A buffer view's copy, title address, bytes, unordered access.
+pub(crate) type HeapBuffer = (Arc<Shadow>, u64, u64, bool);
+
+/// What [`HostHeap::make_marked`] made.
+pub(crate) enum Marked {
+    Nothing,
+    /// A placed texture's view: the title texture, to upload.
+    Texture(usize),
+    /// A buffer view, now kept current.
+    Buffer,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -192,6 +223,17 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![Kept::Nothing; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize], extra as usize)),
+            buffers: Mutex::default(),
+            refreshed: std::sync::atomic::AtomicU64::new(u64::MAX),
+            strides: (!sampler)
+                .then(|| host.upload_buffer(u64::from((count + extra).max(victory_shader::emit::HEAP_VIEWS)) * 4))
+                .flatten()
+                .map(|(buffer, data)| {
+                    crate::host::name(&buffer, || "view strides".into());
+                    // SAFETY: our mapped buffer of that many dwords.
+                    unsafe { std::ptr::write_bytes(data, 0, (count + extra).max(victory_shader::emit::HEAP_VIEWS) as usize * 4) };
+                    (buffer, data as usize)
+                }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -437,6 +479,11 @@ impl HostHeap {
         });
         let copy = kept.copy();
         self.keep(index, kept);
+        // A rebuilt table's slots are dynamic: shaders reading elements of
+        // their buffers find the stride here too.
+        if !self.sampler {
+            self.write_stride(index, view_stride(view));
+        }
         copy
     }
 
@@ -551,36 +598,82 @@ impl HostHeap {
         }
     }
 
-    /// Makes the view of slot `index` (at `handle` in title memory) if it
-    /// is a placed texture's the host left null for later ([`Self::mirror`]),
-    /// as a draw reading it through a table would: the title texture it
-    /// views, if it made it.
-    pub(crate) fn make_placed(&self, index: u32, handle: u64) -> Option<usize> {
+    /// For slot `index` (at `handle` in title memory), which a shader read
+    /// from the heap itself: makes its view if the host left it null for
+    /// later ([`Self::mirror`]), as a draw reading it through a table would,
+    /// and enters a buffer view in [`Self::heap_buffers`] to be kept
+    /// current. What it made: a placed texture (to upload) or a buffer.
+    pub(crate) fn make_marked(&self, index: u32, handle: u64) -> Marked {
         use std::sync::atomic::Ordering::Relaxed;
         if index >= self.count || self.sampler {
             PLACED_WHY[0].fetch_add(1, Relaxed);
-            return None;
+            return Marked::Nothing;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
-        if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == key {
-            PLACED_WHY[1].fetch_add(1, Relaxed);
-            return None;
-        }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == key;
         let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
             PLACED_WHY[2].fetch_add(1, Relaxed);
-            return None;
+            return Marked::Nothing;
         };
-        if !is_placed_texture(&view) {
+        if is_placed_texture(&view) {
+            if made {
+                PLACED_WHY[1].fetch_add(1, Relaxed);
+                return Marked::Nothing;
+            }
+            self.mirror(index, handle, true);
+            return match placed_texture(&view) {
+                Some(View::Shader(texture, _)) => Marked::Texture(texture),
+                _ => Marked::Nothing,
+            };
+        }
+        if !view.is_buffer() {
             PLACED_WHY[3].fetch_add(1, Relaxed);
-            return None;
+            return Marked::Nothing;
         }
-        self.mirror(index, handle, true);
-        match placed_texture(&view) {
-            Some(View::Shader(texture, _)) => Some(texture),
-            _ => None,
+        // A buffer view: made (unless a draw made it) and kept current.
+        let copy = if made {
+            self.copy_at(index)
+        } else {
+            self.mirror(index, handle, true).and_then(|(_, copy)| copy)
+        };
+        let entry = copy.and_then(|c| {
+            let (address, len) = buffer_range(&view)?;
+            let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+            Some((c, address, len, unordered))
+        });
+        let fresh = entry.is_some() && !self.has_buffer(index);
+        self.note_buffer(index, entry);
+        if fresh { Marked::Buffer } else { Marked::Nothing }
+    }
+
+    /// Enters `stride` for title slot `index` in the view-stride table.
+    fn write_stride(&self, index: u32, stride: u32) {
+        let Some((_, data)) = &self.strides else { return };
+        if index >= (self.count + self.dynamic).max(victory_shader::emit::HEAP_VIEWS) {
+            return;
         }
+        // SAFETY: a dword of the mapped table, which has one per slot below
+        // the larger of the heap's slots and `HEAP_VIEWS`.
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+    }
+
+    /// The view-stride table and its dwords, for root SRV `VIEW_STRIDES`.
+    pub(crate) fn strides(&self) -> Option<(&ID3D12Resource, u32)> {
+        let elements = (self.count + self.dynamic).max(victory_shader::emit::HEAP_VIEWS);
+        self.strides.as_ref().map(|(buffer, _)| (buffer, elements))
+    }
+
+    /// Whether slot `index`'s buffer view is in [`Self::heap_buffers`].
+    fn has_buffer(&self, index: u32) -> bool {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).slots.contains_key(&index)
+    }
+
+    /// Whether the heap's buffers are due to be brought up to date in title
+    /// frame `frame`: once per frame, for the first list that needs them.
+    pub(crate) fn heap_buffers_due(&self, frame: u64) -> bool {
+        self.refreshed.swap(frame, std::sync::atomic::Ordering::Relaxed) != frame
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -620,10 +713,18 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
+                self.note_buffer(index, None);
+                self.write_stride(index, 0);
             }
             return None;
         };
         let copy = if made[index as usize] != key {
+            // A slot rewritten: its old buffer view is no longer what the
+            // heap holds (`heap_buffers`); its stride is the new view's.
+            if !self.sampler {
+                self.note_buffer(index, None);
+                self.write_stride(index, view_stride(&view));
+            }
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -649,6 +750,51 @@ impl HostHeap {
             None
         };
         Some((view, copy))
+    }
+
+    /// Enters (or, with `None`, removes) the buffer view of title slot
+    /// `index` in [`HostHeap::heap_buffers`].
+    fn note_buffer(&self, index: u32, entry: Option<HeapBuffer>) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = match entry {
+            Some(e) => buffers
+                .slots
+                .insert(index, e.clone())
+                .is_none_or(|old| !Arc::ptr_eq(&old.0, &e.0) || (old.1, old.2, old.3) != (e.1, e.2, e.3)),
+            None => buffers.slots.remove(&index).is_some(),
+        };
+        if changed {
+            buffers.hulls = None;
+        }
+    }
+
+    /// The title memory the buffer views shaders read from this heap itself
+    /// (marked, [`Self::make_marked`]) read or write, merged per copy and
+    /// kind (unordered access or not): what no draw names. Remerged only
+    /// after a view changed.
+    /// shortcut: one range per copy, from its lowest view to its highest;
+    /// ranges between views are brought up to date too.
+    pub(crate) fn heap_buffers(&self) -> Vec<HeapBuffer> {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hulls) = &buffers.hulls {
+            return hulls.clone();
+        }
+        let mut merged: std::collections::HashMap<(usize, bool), HeapBuffer> = std::collections::HashMap::new();
+        for (copy, address, len, unordered) in buffers.slots.values() {
+            let key = (Arc::as_ptr(copy) as usize, *unordered);
+            let end = address + len;
+            merged
+                .entry(key)
+                .and_modify(|h| {
+                    let start = h.1.min(*address);
+                    h.2 = (h.1 + h.2).max(end) - start;
+                    h.1 = start;
+                })
+                .or_insert_with(|| (copy.clone(), *address, *len, *unordered));
+        }
+        let hulls: Vec<HeapBuffer> = merged.into_values().collect();
+        buffers.hulls = Some(hulls.clone());
+        hulls
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1361,6 +1507,43 @@ pub(crate) static PLACED_WHY: [std::sync::atomic::AtomicU64; 4] =
 /// Placed-texture views the host tried to make and could not (left null
 /// although marked made).
 pub(crate) static PLACED_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The byte stride of buffer view `view` as shaders read it by element (0
+/// for none or not a buffer view): a structured view's element, 4 for raw
+/// views and constant buffers, a typed view's format size.
+fn view_stride(view: &View) -> u32 {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            match desc[..10].try_into() {
+                Ok(words) => (*unordered, words),
+                Err(_) => return 0,
+            }
+        }
+        _ => return 0,
+    };
+    // The view dimension: buffer (1) for shader and unordered views alike.
+    if words[1] != 1 {
+        return 0;
+    }
+    let element = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        }
+    } else {
+        element_size(&srv_desc(words))
+    };
+    u32::try_from(element).unwrap_or(0)
+}
 
 /// Whether `view` is a view of a texture the title placed in memory itself.
 fn is_placed_texture(view: &View) -> bool {

@@ -98,6 +98,11 @@ pub(crate) struct State {
     /// The heap-usage bitmap made for this list, by its view heap: the
     /// table of one view of it (`crate::descriptor::usage_bitmap`).
     heap_usage: Option<(usize, D3D12_GPU_DESCRIPTOR_HANDLE)>,
+    /// The view heap whose buffers this list brought up to date for
+    /// programs reading the heap itself (0: none yet).
+    heap_buffers: usize,
+    /// The view-stride table's view made for this list, by its view heap.
+    stride_view: Option<(usize, D3D12_GPU_DESCRIPTOR_HANDLE)>,
     /// The values sent to each stage for the next device-removed marker.
     #[cfg(feature = "diagnostics")]
     bound_user_data: Vec<BoundUserData>,
@@ -118,6 +123,15 @@ impl Drop for State {
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Lists that brought a heap's buffers up to date for programs reading the
+/// heap itself, and the ranges they did, since the last call.
+static HEAP_REFRESHES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`HEAP_REFRESHES`], counted again from 0.
+pub(crate) fn take_heap_refreshes() -> [u64; 2] {
+    [0, 1].map(|i| HEAP_REFRESHES[i].swap(0, Ordering::Relaxed))
+}
 
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
@@ -615,6 +629,26 @@ impl State {
             ];
             for (views, kind) in views {
                 for &(slot, param) in views {
+                    if kind == SRV && slot == victory_shader::emit::VIEW_STRIDES {
+                        // The host's view-stride table, not a title view.
+                        match self.stride_table(list) {
+                            // SAFETY: an open list; the slot is in the bound
+                            // view heap, the address that of a live buffer.
+                            Some((table, gpu)) => unsafe {
+                                match (crate::pipeline::host::bounded_root_srvs(), compute) {
+                                    (true, true) => l.SetComputeRootDescriptorTable(param, table),
+                                    (true, false) => l.SetGraphicsRootDescriptorTable(param, table),
+                                    (false, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                                    (false, false) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                                }
+                            },
+                            None => {
+                                self.table_failed = true;
+                                self.drop_for("pipeline made, view strides without a view heap or slot");
+                            }
+                        }
+                        continue;
+                    }
                     if kind == SRV && crate::pipeline::host::bounded_root_srvs() {
                         // A table of one view bounded by the buffer's host
                         // copy; without a view heap or a slot the shader would
@@ -684,6 +718,29 @@ impl State {
                 once!("a draw or dispatch dropped: a root UAV or SRV could not be bound");
                 return false;
             }
+        }
+        // Programs picking views from the heap itself read buffers no draw
+        // names: the buffer views they were seen to read (marked) are
+        // brought up to date for them, once per title frame.
+        // shortcut: what they write is not copied back to title memory (a
+        // snapshot of every unordered range per submission stalled the
+        // world's first frame past the title's watchdog): it stays in the
+        // host copies, which a refresh overwrites only where the title
+        // wrote since.
+        if self.heap_buffers != self.heaps[0] && p.stages.iter().any(|s| s.translated().reads_heap) {
+            let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+            if let Some(host) = heap
+                .and_then(|h| h.host())
+                .filter(|h| h.heap_buffers_due(crate::frame::current()))
+            {
+                let ranges = host.heap_buffers();
+                HEAP_REFRESHES[0].fetch_add(1, Ordering::Relaxed);
+                HEAP_REFRESHES[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                for (copy, address, len, _) in ranges {
+                    copy.refresh(list, address, len);
+                }
+            }
+            self.heap_buffers = self.heaps[0];
         }
         for stage in &p.stages {
             let Some(param) = stage.heap_used else {
@@ -827,6 +884,30 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.note_dropped_writes();
         }
+    }
+
+    /// The bound view heap's view-stride table: a table of one raw view of
+    /// it in a dynamic slot of that heap (one per heap and list), and its
+    /// GPU address. `None` without a view heap, a table or a slot.
+    fn stride_table(&mut self, list: &HostList) -> Option<(D3D12_GPU_DESCRIPTOR_HANDLE, u64)> {
+        let heap = self.heaps[0];
+        let title = (heap != 0).then(|| crate::descriptor::heap(heap as This))?;
+        let host = title.host()?;
+        let (buffer, elements) = host.strides()?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        if let Some((h, table)) = self.stride_view
+            && h == heap
+        {
+            return Some((table, gpu));
+        }
+        let index = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(title) as usize, index, 1));
+        host.raw_srv_at(index, Some(buffer), 0, elements);
+        list.keep(buffer);
+        let table = host.gpu(index);
+        self.stride_view = Some((heap, table));
+        Some((table, gpu))
     }
 
     /// This list's heap-usage bitmap for view heap `heap`, as a table of one
