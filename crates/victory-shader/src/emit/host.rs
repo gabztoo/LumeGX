@@ -310,6 +310,17 @@ impl Host {
         vs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_gs(root, vs, &[], ps)
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry shader (none if empty).
+    pub fn pipeline_gs(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -340,6 +351,10 @@ impl Host {
             PS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
+            },
+            GS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                BytecodeLength: gs.len(),
             },
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {

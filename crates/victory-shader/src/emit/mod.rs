@@ -35,6 +35,10 @@
 //!   shader resource view of the buffer's host copy in the title's slot,
 //!   since the console needs 16-byte alignment and a host constant buffer
 //!   view 256. A table holding one is not copied per draw.
+//! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
+//!   vertex shader's outputs completes each rectangle with its fourth
+//!   corner `v0 + v2 - v1`, as the console's hardware does, for direct and
+//!   indirect draws alike.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -88,6 +92,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rect;
+pub use rect::rectangle_gs;
 mod sampler;
 mod shader;
 #[cfg(windows)]
