@@ -196,5 +196,69 @@ fn lds_in_a_group_over_32_keeps_wave64() {
     if let StageIo::Cs(cs) = &mut program.io {
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS (LDS_SIZE, in 512-byte units)
     }
-    assert_eq!(declared_wave(&lowered(&program, 32)), 64);
+    let was = lower::TEST_SPLIT_LDS.replace(Some(false));
+    let wave = declared_wave(&lowered(&program, 32));
+    lower::TEST_SPLIT_LDS.set(was);
+    assert_eq!(wave, 64);
+}
+
+/// 64 threads in one console wave with LDS: each writes its index to
+/// `lds[t]` and reads `lds[t ^ 32]`, the other half's, without a barrier
+/// (the console runs the wave in step). With `VICTORY_WAVE_SPLIT_LDS` the
+/// two host waves meet before each LDS access and get the console's
+/// result; without it the program keeps `WaveSize(64)`.
+#[test]
+fn lds_shared_across_halves_is_ordered_by_meetings_when_split() {
+    let body = [
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x3A06_00A0, // v_xor_b32 v3, 32, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+        0xD834_0000,
+        0x0000_0002, // ds_write_b32 v2, v0
+        0xD8D8_0000,
+        0x0100_0003, // ds_read_b32 v1, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    let mut program = native(&[&body[..], &STORE_V1_AT_THREAD].concat(), 64);
+    if let StageIo::Cs(cs) = &mut program.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let with = |on: bool| {
+        let was = lower::TEST_SPLIT_LDS.replace(Some(on));
+        let shader = lowered(&program, 32);
+        lower::TEST_SPLIT_LDS.set(was);
+        shader
+    };
+    assert_eq!(declared_wave(&with(false)), 64, "split off");
+    let shader = with(true);
+    assert_eq!(declared_wave(&shader), 32, "split on");
+    let expected: Vec<u32> = (0..64).map(|t| t ^ 32).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the {label} device does not take waves of 32; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], expected, "{label}");
+        eprintln!("ran on the {label} device");
+    }
 }
