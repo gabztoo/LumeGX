@@ -275,6 +275,39 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// PresentX's plane *prefix* is known, not the array stride. Inspect only
+/// plane zero until we know the complete ABI; never treat the next 24 bytes
+/// as plane one. A token or back-buffer rotation alone is not a new shape.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn trace_present(planes: u32, first: *const Plane, parameters: *const u8) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TRACE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    type Shape = (u32, Option<u32>, bool, bool, Vec<Option<(u64, u32, u32)>>);
+    static PREVIOUS: std::sync::Mutex<Option<Shape>> = std::sync::Mutex::new(None);
+    // SAFETY: PresentX supplies at least its first prefix for a nonempty array.
+    let plane = if planes != 0 { unsafe { first.as_ref() } } else { None };
+    let count = plane.map(|p| p.count);
+    let have_resources = plane.is_some_and(|p| !p.resources.is_null());
+    // Bound diagnostic reads/output even for an unexpected count.
+    let resources = plane.filter(|p| !p.resources.is_null()).map_or(&[][..], |p| {
+        // SAFETY: the caller supplies count resource pointers for this plane,
+        // valid until PresentX returns (no deferred reads or host allocation).
+        unsafe { std::slice::from_raw_parts(p.resources, p.count.min(64) as usize) }
+    });
+    let descriptions = resources.iter().map(|&r| crate::resource::present_shape(r)).collect();
+    let shape = (planes, count, have_resources, !parameters.is_null(), descriptions);
+    let mut prev = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+    if prev.as_ref() != Some(&shape) {
+        tracing::info!(planes, plane0_count = ?count, token = ?plane.map(|p| p.token),
+            plane_array = ?first, parameters = ?parameters, plane0_resources = ?resources,
+            plane0_width_height_format = ?shape.4, uninspected_planes = planes.saturating_sub(1),
+            "PresentX shape changed");
+        *prev = Some(shape);
+    }
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -285,6 +318,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_present(planes, plane_parameters, _parameters);
     // The parameter arrays belong to the caller, so hold only the resource.
     #[cfg(windows)]
     let resource = if planes > 0
@@ -535,6 +570,16 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn present_trace_requires_only_the_first_prefix() {
+        let resources = [std::ptr::null(); 2];
+        let first = Plane { token: 123, count: 2, resources: resources.as_ptr() };
+        // Deliberately supply just the known prefix even for a two-plane report.
+        trace_present(2, &first, std::ptr::null());
+        trace_present(0, std::ptr::null(), std::ptr::null());
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

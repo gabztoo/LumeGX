@@ -1415,6 +1415,14 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// PresentX diagnostic only: title description without materializing a host texture.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn present_shape(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() { return None; }
+    let d = &resource(this).desc;
+    Some((d.width, d.height, d.format))
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
