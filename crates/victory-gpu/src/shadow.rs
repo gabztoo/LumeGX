@@ -402,6 +402,17 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// Bytes from `address` to the end of the innermost registered title buffer
+/// holding `address`, if one does (`None` for loose memory).
+pub(crate) fn registered_left(address: u64) -> Option<u64> {
+    let map = buffers();
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end > address)
+        .map(|(_, e)| e.end - address)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

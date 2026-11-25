@@ -470,22 +470,6 @@ impl HostHeap {
         }
     }
 
-    /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, Kept::Nothing);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
-    }
-
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// `elements` dwords of `buffer` from dword `first`: bounded, so what
     /// shaders access past it is dropped (reads give 0), where a root view
@@ -663,9 +647,19 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// The title memory a buffer constant, shader or unordered access view
+/// reads: its address and length (a constant buffer cut to its registered
+/// title buffer's end, in whole dwords, so that its copy is that buffer's).
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        if address == 0 {
+            return None;
+        }
+        let bytes = u64::from(size);
+        let clamped =
+            crate::shadow::registered_left(address).map_or(bytes, |left| bytes.min(left));
+        return Some((address, clamped & !3));
+    }
     let (address, _, unordered, words) = buffer_parts(view)?;
     let (from, bytes, _) = extent(address, unordered, words);
     Some((from, bytes))
@@ -732,7 +726,7 @@ fn unordered_extent(address: u64, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> (u
 pub(crate) enum Kept {
     /// Nothing of the host's (a sampler, a null view, a list's memory).
     Nothing,
-    /// A host resource: a texture, or the copy a constant buffer view is of.
+    /// A host resource: a texture, or a buffer a root view reads.
     Resource { _resource: ID3D12Resource },
     /// A copy of title buffer memory a shader or unordered access view is
     /// of: its buffer's copy, or a copy of just the view's bytes.
@@ -1164,25 +1158,31 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
-        &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
+        &View::Constant(address, _) => {
+            // Constant buffers in the title's slots, read through a table or
+            // the heap itself, are read as raw buffers by translated shaders
+            // (`victory_shader::emit`, "Constant buffers in tables and the
+            // heap"): the console needs 16-byte alignment, a host constant
+            // buffer view 256, which most of the title's do not have on the
+            // host. The view is of the buffer's host copy, which the slot
+            // keeps and its draws bring up to date (`readable`).
+            let (_, bytes) = buffer_range(view)?;
+            if bytes == 0 {
                 return None;
             }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: (bytes / 4) as u32,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
             };
-            // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Kept::Resource {
-                _resource: shadow.buffer.clone(),
-            })
+            buffer_srv(address, bytes, desc, at, false)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1326,11 +1326,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        // Read as raw buffers, as made (`make`).
+        View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -1567,6 +1564,44 @@ mod tests {
         assert!(refusal_kind(10, 9, 9).starts_with("exhaustion"));
         assert!(refusal_kind(10, 30, 9).starts_with("fragmentation"));
         assert!(refusal_kind(10, 30, 10).starts_with("search bug"));
+    }
+
+    /// A constant buffer view naming 64 KiB near its registered buffer's end
+    /// is cut to that buffer, in whole dwords, so that its slot is a raw view
+    /// of that buffer's copy and not of a loose window of its own; a null one
+    /// has no range.
+    #[test]
+    fn constant_views_read_their_buffers_copy() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let (start, len) = (0x7b00_0000_0000_u64, 0x1_0000_u64);
+        crate::shadow::register(usize::MAX - 5, start, len);
+        assert_eq!(buffer_range(&View::Constant(0, 256)), None);
+        assert_eq!(
+            buffer_range(&View::Constant(start + 0x100, 256)),
+            Some((start + 0x100, 256))
+        );
+        let near_end = View::Constant(start + 0xfc00, 0x1_0000);
+        assert_eq!(buffer_range(&near_end), Some((start + 0xfc00, 0x400)));
+        let kept = heap.make_at(0, &near_end).expect("a raw view of the buffer's copy");
+        let copy = crate::shadow::find(start, len).expect("the buffer's copy");
+        assert!(Arc::ptr_eq(&kept, &copy), "the registered buffer's copy");
+        // An unordered view of the same buffer writes the copy the constant
+        // view reads: what a shader writes there is what the next one reads.
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = len as u32;
+        let mut desc = [0u32; 16];
+        desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        desc[1] = 1; // buffer dimension
+        (desc[4], desc[8]) = ((len / 4) as u32, D3D12_BUFFER_UAV_FLAG_RAW.0 as u32);
+        (desc[10], desc[11]) = (start as u32, (start >> 32) as u32);
+        let written = heap
+            .make_at(1, &View::Placed(true, resource, desc))
+            .expect("an unordered view of the buffer");
+        assert!(Arc::ptr_eq(&kept, &written), "one copy for the reads and the writes");
+        crate::shadow::unregister(usize::MAX - 5, start);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
