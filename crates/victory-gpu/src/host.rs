@@ -1635,6 +1635,12 @@ impl Meter {
                 "depth bounds: {bounded:.1} draws/frame with the test, {bounds_set:.1} bounds set/frame"
             );
             // Totals since the last of these lines, not per frame.
+            let [bounded, zeros, no_slot, no_heap] = crate::draw::take_root_srvs();
+            tracing::info!(
+                "root SRVs: {bounded} bounded views made, {zeros} reading zeros (unset, no \
+                 copy or off 16 bytes), {no_slot} without a slot, {no_heap} draws dropped with \
+                 no view heap"
+            );
             let [exhausted, fragmented] = crate::descriptor::host::take_refused();
             let [capacity, in_use, peak] = crate::descriptor::host::take_occupancy();
             tracing::info!(
