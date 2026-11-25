@@ -12,7 +12,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -87,6 +87,11 @@ fn native(body: &[u32], threads: u32) -> NativeProgram {
 /// `native` lowered for a host whose widest wave is `host_wave` lanes
 /// (0: not known), and validated when `dxil.dll` is there.
 fn lowered(native: &NativeProgram, host_wave: u32) -> HostShader {
+    try_lowered(native, host_wave).expect("lower")
+}
+
+/// As [`lowered`], with the lowering's refusal.
+fn try_lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
@@ -104,7 +109,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> HostShader {
         mesh_stride: 0,
     });
     lower::TEST_HOST_WAVE.set(was);
-    let lowered = lowered.expect("lower");
+    let lowered = lowered?;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -119,7 +124,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> HostShader {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
     }
-    shader
+    Ok(shader)
 }
 
 /// The wave size the program declares (`WaveSize`, from its pipeline state
@@ -260,5 +265,129 @@ fn lds_shared_across_halves_is_ordered_by_meetings_when_split() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], expected, "{label}");
         eprintln!("ran on the {label} device");
+    }
+}
+
+/// Runs `shader` (raw UAV of `dwords` dwords at heap index 0, one group)
+/// on each device that takes it; what each wrote.
+fn on_devices(shader: &HostShader, dwords: u32) -> Vec<(&'static str, Vec<u32>)> {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the {label} device does not take waves of 32; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        eprintln!("ran on the {label} device");
+        out.push((label, words[0].clone()));
+    }
+    out
+}
+
+/// `body` (leaving its result in v1, stored to dword `thread index`) in a
+/// wave64 program of 128 threads (two console waves): lowered for a 32-lane
+/// host without and with `VICTORY_WAVE_EXCHANGE`, and run with it.
+fn exchanged(body: &[u32]) -> Vec<(&'static str, Vec<u32>)> {
+    let program = native(&[body, &STORE_V1_AT_THREAD].concat(), 128);
+    let with = |on: bool| {
+        let was = lower::TEST_EXCHANGE.replace(Some(on));
+        let shader = lowered(&program, 32);
+        lower::TEST_EXCHANGE.set(was);
+        shader
+    };
+    assert_eq!(declared_wave(&with(false)), 64, "exchange off");
+    let shader = with(true);
+    assert_eq!(declared_wave(&shader), 32, "exchange on");
+    on_devices(&shader, 128)
+}
+
+/// `v_readlane_b32 s12, v0, 40`: lane 40 is in the upper half of each
+/// console wave, the other host wave for the lower half's threads.
+#[test]
+fn a_lane_read_across_halves_goes_through_the_exchange() {
+    let body = [
+        0x35 << 26 | 0x360 << 16 | 12,
+        256 | 168 << 9, // v_readlane_b32 s12, v0, 40
+        0x7E02_020C,    // v_mov_b32 v1, s12
+    ];
+    let want: Vec<u32> = (0..128).map(|t| (t & !63) + 40).collect();
+    for (label, got) in exchanged(&body) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+/// `v_mbcnt_lo/hi` of all ones: the console lane, 32..63 in the upper half.
+#[test]
+fn a_lane_count_over_both_halves_is_the_console_lane() {
+    let body = [
+        0x35 << 26 | 0x365 << 16 | 1,
+        193 | 128 << 9, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x35 << 26 | 0x366 << 16 | 1,
+        193 | 257 << 9, // v_mbcnt_hi_u32_b32 v1, -1, v1
+    ];
+    let want: Vec<u32> = (0..128).map(|t| t & 63).collect();
+    for (label, got) in exchanged(&body) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+/// `vcc = t < 40` counted as a number (`s_bcnt1_i32_b64`): lanes 0..39 of
+/// the first console wave, 32 in its lower half and 8 in its upper; none
+/// in the second (threads 64..127).
+#[test]
+fn a_lane_mask_counted_as_a_number_holds_both_halves() {
+    let body = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ];
+    let want: Vec<u32> = (0..128).map(|t| if t < 64 { 40 } else { 0 }).collect();
+    for (label, got) in exchanged(&body) {
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+/// `if (WaveReadLaneFirst(t) == 0) v1 = WaveReadLane(t, 40)`: the branch is
+/// uniform within a console wave but its condition comes from the lanes, so
+/// the two console waves of the group may go two ways, and the exchange
+/// inside it (two group barriers) would wait for threads that never come.
+/// Refused rather than translated with barriers there.
+#[test]
+fn no_exchange_inside_a_branch_the_waves_of_a_group_may_take_apart() {
+    let body = [
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E1A_0500, // v_readfirstlane_b32 s13, v0
+        0xBF06_800D, // s_cmp_eq_u32 s13, 0
+        0xBF85_0003, // s_cbranch_scc1 past the next three words
+        0x35 << 26 | 0x360 << 16 | 12,
+        256 | 168 << 9, // v_readlane_b32 s12, v0, 40
+        0x7E02_020C,    // v_mov_b32 v1, s12
+    ];
+    let program = native(&[&body[..], &STORE_V1_AT_THREAD].concat(), 128);
+    let was = lower::TEST_EXCHANGE.replace(Some(true));
+    let result = try_lowered(&program, 32);
+    lower::TEST_EXCHANGE.set(was);
+    match result {
+        Err(e) => eprintln!("refused: {e}"),
+        Ok(shader) => panic!("translated with WaveSize {}", declared_wave(&shader)),
     }
 }

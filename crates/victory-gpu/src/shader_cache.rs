@@ -61,6 +61,7 @@ fn build() -> &'static [u8; 32] {
                 // that a run with it translates.
                 bytes.push(u8::from(victory_shader::emit::wave_why()));
                 bytes.push(u8::from(victory_shader::emit::wave_split_lds()));
+                bytes.push(u8::from(victory_shader::emit::wave_exchange()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
