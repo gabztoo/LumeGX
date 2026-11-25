@@ -80,6 +80,9 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Root SRVs bound as tables of one bounded view in this list: (view
+    /// heap, title address, host copy) → dynamic slot.
+    root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
     /// The pipeline of the last draw prepared runs the depth bounds test.
     depth_bounds: bool,
 }
@@ -126,6 +129,25 @@ pub(crate) fn take_past_mirrored() -> u64 {
     PAST_MIRRORED.swap(0, Ordering::Relaxed)
 }
 static PAST_MIRRORED: AtomicU64 = AtomicU64::new(0);
+
+/// Root SRVs bound as tables since the last call: views made of a host copy,
+/// views reading zeros (no address set, no copy, a start off 16 bytes), slots
+/// refused, and draws dropped for want of a bound view heap.
+pub(crate) fn take_root_srvs() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| ROOT_SRVS[i].swap(0, Ordering::Relaxed))
+}
+static ROOT_SRVS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The dwords a root SRV's raw view covers in its host copy: from `offset`
+/// bytes in (on 16 bytes, where raw views start; else none) to `left` bytes
+/// on, at least one and at most the host's 2^27 elements of a buffer view.
+fn root_view_range(offset: u64, left: u64) -> Option<(u64, u32)> {
+    if !offset.is_multiple_of(16) {
+        return None;
+    }
+    let elements = (left / 4).clamp(1, 1 << 27) as u32;
+    Some((offset / 4, elements))
+}
 
 /// Tables made afresh in dynamic slots (once per list and contents), since
 /// the last call.
@@ -537,6 +559,28 @@ impl State {
             ];
             for (views, kind) in views {
                 for &(slot, param) in views {
+                    if kind == SRV && crate::pipeline::host::bounded_root_srvs() {
+                        // A table of one view bounded by the buffer's host
+                        // copy; without a view heap or a slot the shader would
+                        // read an unbound table, so the draw is dropped.
+                        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                            Some(&Root::View(address)) => Some(address),
+                            _ => None,
+                        };
+                        match self.root_srv_table(list, address) {
+                            // SAFETY: an open list; the slot is in the bound
+                            // view heap.
+                            Some(table) => unsafe {
+                                if compute {
+                                    l.SetComputeRootDescriptorTable(param, table);
+                                } else {
+                                    l.SetGraphicsRootDescriptorTable(param, table);
+                                }
+                            },
+                            None => self.table_failed = true,
+                        }
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -575,7 +619,7 @@ impl State {
                 }
             }
             if self.table_failed {
-                once!("a draw or dispatch dropped: a root UAV could not be bound");
+                once!("a draw or dispatch dropped: a root UAV or SRV could not be bound");
                 return false;
             }
         }
@@ -726,6 +770,69 @@ impl State {
         let len = left.min(1 << 20);
         shadow.refresh(list, address, len);
         shadow.gpu_writes(list, address, len);
+        Some(host.gpu(index))
+    }
+
+    /// A root SRV at title address `address` as a table of one raw view of
+    /// its buffer's host copy, from the address to the copy's end, in a
+    /// dynamic slot of the bound view heap (one slot per address and copy in
+    /// a list): bounded, where a root descriptor reaches whatever the host
+    /// placed after the copy. With no address set, no copy or a start off 16
+    /// bytes, the view reads zeros (counted). `None` without a view heap or a
+    /// free slot.
+    /// shortcut: 1 MiB is brought up to date from the address (cut at the
+    /// buffer's end), as for a root descriptor; the view spans the rest of
+    /// the copy as it was last brought up to date.
+    fn root_srv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+    ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let Some(host) = heap.and_then(|h| h.host()) else {
+            ROOT_SRVS[3].fetch_add(1, Ordering::Relaxed);
+            once!("a root SRV with no view heap bound: the draw or dispatch is dropped");
+            return None;
+        };
+        let heap = std::ptr::from_ref(heap?) as usize;
+        let shadow = address.and_then(|a| crate::shadow::find(a, 1));
+        let key = (
+            heap,
+            address.unwrap_or(0),
+            shadow.as_ref().map_or(0, |s| std::sync::Arc::as_ptr(s) as usize),
+        );
+        let index = match self.root_srv_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    ROOT_SRVS[2].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                };
+                self.dynamic.push((heap, index, 1));
+                self.root_srv_slots.insert(key, index);
+                let range = match (address, &shadow) {
+                    (Some(a), Some(s)) => root_view_range(s.offset(a), s.left(a)),
+                    _ => None,
+                };
+                match (range, &shadow) {
+                    (Some((first, elements)), Some(s)) => {
+                        host.raw_srv_at(index, Some(&s.buffer), first, elements);
+                        ROOT_SRVS[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        if address.is_some() && shadow.is_some() {
+                            once!("a root SRV not on 16 bytes of its host copy reads zeros");
+                        }
+                        host.raw_srv_at(index, None, 0, 0);
+                        ROOT_SRVS[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                index
+            }
+        };
+        if let (Some(a), Some(s)) = (address, &shadow) {
+            s.refresh(list, a, s.left(a).min(1 << 20));
+        }
         Some(host.gpu(index))
     }
 
@@ -1476,6 +1583,16 @@ fn fresh_table_range(entries: &[&UsedResource], mirrored: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root SRV's view starts at its address (on 16 bytes) and ends at its
+    /// copy's end, at least one dword and at most a buffer view's limit.
+    #[test]
+    fn root_srv_views_end_at_their_copy() {
+        assert_eq!(root_view_range(0x30, 0x100), Some((0xc, 0x40)));
+        assert_eq!(root_view_range(0, 2), Some((0, 1)));
+        assert_eq!(root_view_range(0x40, 1 << 40), Some((0x10, 1 << 27)));
+        assert_eq!(root_view_range(0x34, 0x100), None);
+    }
 
     fn used_at(offset_dwords: u32) -> UsedResource {
         UsedResource {

@@ -502,6 +502,40 @@ impl HostHeap {
         };
     }
 
+    /// Makes slot `index` (a dynamic one) a raw shader resource view of
+    /// `elements` dwords of `buffer` from dword `first`, or one that reads
+    /// zeros without a buffer: a root SRV with a bound, whose reads past it
+    /// return zeros where a root descriptor reaches whatever the host placed
+    /// after the buffer.
+    pub(crate) fn raw_srv_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, elements: u32) {
+        let Some(buffer) = buffer else {
+            null_buffer_view(self.cpu(index));
+            self.keep(index, Kept::Nothing);
+            return;
+        };
+        // Held alive while the slot views it; its refresh is the root view's.
+        self.keep(index, Kept::Resource { _resource: buffer.clone() });
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first,
+                    NumElements: elements,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a live buffer and a slot of our heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+    }
+
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a plain query of our heap.

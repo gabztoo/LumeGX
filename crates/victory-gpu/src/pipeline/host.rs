@@ -269,6 +269,25 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// Whether root SRVs are bound as tables of one raw view of the title
+/// buffer's host copy, which ends at the copy's end (reads past it return
+/// zeros), rather than as root descriptors, which have no bound: the mesh
+/// shaders of the world's hangs fetch through a root SRV with no record
+/// limit and read megabytes past the copy (upstream #951).
+/// `VICTORY_ROOT_SRV_DIRECT=1` binds root descriptors as before, for A/B
+/// runs with one binary; it changes no translation (the root signature is
+/// part of the pipeline library's names).
+pub(crate) fn bounded_root_srvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let direct = std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_some_and(|v| v == "1");
+        if direct {
+            tracing::warn!("VICTORY_ROOT_SRV_DIRECT=1: root SRVs bound as root descriptors");
+        }
+        !direct
+    })
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -361,8 +380,9 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        // Root UAV tables: their ranges, and (parameter, range, visibility).
-        let mut uav_ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = Vec::new();
+        // Root view tables (UAVs, and SRVs when bounded): their ranges, and
+        // (parameter, range, visibility).
+        let mut view_ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = Vec::new();
         let mut table_of = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
@@ -402,6 +422,24 @@ impl HostPipeline {
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                        // A table of one bounded view (see `bounded_root_srvs`).
+                        view_ranges.push(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: 1,
+                            BaseShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        });
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                            ..Default::default()
+                        });
+                        table_of.push((params.len() - 1, view_ranges.len() - 1, visibility));
+                        continue;
+                    }
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -419,7 +457,7 @@ impl HostPipeline {
             // no bounds; see `draw::State::bind`).
             for &slot in &t.root_uavs {
                 stage.root_uavs.push((slot, params.len() as u32));
-                uav_ranges.push(D3D12_DESCRIPTOR_RANGE1 {
+                view_ranges.push(D3D12_DESCRIPTOR_RANGE1 {
                     RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
                     NumDescriptors: 1,
                     BaseShaderRegister: u32::from(slot),
@@ -432,7 +470,7 @@ impl HostPipeline {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                     ..Default::default()
                 });
-                table_of.push((params.len() - 1, uav_ranges.len() - 1, visibility));
+                table_of.push((params.len() - 1, view_ranges.len() - 1, visibility));
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -457,7 +495,7 @@ impl HostPipeline {
         for (param, range, visibility) in table_of {
             params[param].Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE1 {
                 NumDescriptorRanges: 1,
-                pDescriptorRanges: &uav_ranges[range],
+                pDescriptorRanges: &view_ranges[range],
             };
             params[param].ShaderVisibility = visibility;
         }
