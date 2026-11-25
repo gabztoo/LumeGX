@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -297,6 +297,9 @@ pub(crate) struct Stage {
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Our root parameter of the heap-usage bitmap
+    /// (`crate::descriptor::usage_bitmap`), if the stage marks heap slots.
+    pub(crate) heap_used: Option<u32>,
 }
 
 impl Stage {
@@ -392,6 +395,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                heap_used: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -462,6 +466,25 @@ impl HostPipeline {
                     NumDescriptors: 1,
                     BaseShaderRegister: u32::from(slot),
                     RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                });
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    ..Default::default()
+                });
+                table_of.push((params.len() - 1, view_ranges.len() - 1, visibility));
+            }
+            // The heap-usage bitmap: a table of one view, bounded, as the
+            // shader's skipped marks go past its end (`draw::State::bind`).
+            if t.heap_usage {
+                stage.heap_used = Some(params.len() as u32);
+                view_ranges.push(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: 1,
+                    RegisterSpace: MEMORY_SPACE,
                     Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
                         | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
                     OffsetInDescriptorsFromTableStart: 0,

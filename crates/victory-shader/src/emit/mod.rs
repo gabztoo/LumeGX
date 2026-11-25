@@ -106,9 +106,9 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
-pub use lower::{host_max_wave, set_host_max_wave, wave_split_lds, wave_why};
+pub use lower::{heap_usage_marks, host_max_wave, set_host_max_wave, wave_split_lds, wave_why};
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -170,6 +170,14 @@ pub struct HostShader {
     /// Title root parameters read or written as root UAVs (raw buffers),
     /// `u<index>` in [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Whether the host binds the heap-usage bitmap `u1` in
+    /// [`MEMORY_SPACE`] (through a table: a mark the shader skips goes past
+    /// its end): the pixel or compute program takes texture views from the
+    /// heap itself and sets bit `index` for each slot it reads, once per
+    /// wave when the index is uniform and not again once set
+    /// ([`heap_usage_marks`]), so that the host makes the views it left
+    /// null (placed textures) for the next list.
+    pub heap_usage: bool,
 }
 
 impl HostShader {
@@ -323,6 +331,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        heap_usage: l.heap_usage,
     })
 }
 
@@ -581,6 +590,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            heap_usage: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -592,6 +602,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                heap_usage: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

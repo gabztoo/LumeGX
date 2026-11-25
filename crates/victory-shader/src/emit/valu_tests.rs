@@ -149,6 +149,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        heap_usage: lowered.heap_usage,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1048,6 +1049,7 @@ fn structured_buffer_flat_byte_offset_loads_reach_elements_past_the_first() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        heap_usage: lowered.heap_usage,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1222,6 +1224,7 @@ fn table_constant_buffers_read_as_raw_buffers() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        heap_usage: lowered.heap_usage,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1387,6 +1390,7 @@ fn unnamed_table_constant_buffers_read_as_raw_buffers() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        heap_usage: lowered.heap_usage,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

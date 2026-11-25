@@ -189,13 +189,23 @@ impl Host {
             .collect();
         views.sort_unstable_by_key(|&(slot, kind)| (slot, kind.0));
         views.dedup();
-        for (slot, kind) in views {
+        let mut views: Vec<(u32, u32, D3D12_ROOT_PARAMETER_TYPE)> = views
+            .into_iter()
+            .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
+            .collect();
+        // The heap-usage bitmap as a root UAV, for making pipelines; the
+        // runtime binds it through a table, which bounds the marks a shader
+        // skips (sent past its end). This crate's tests never mark.
+        if stages.iter().any(|(s, _)| s.heap_usage) {
+            views.push((1, super::MEMORY_SPACE, D3D12_ROOT_PARAMETER_TYPE_UAV));
+        }
+        for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: kind,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        ShaderRegister: register,
+                        RegisterSpace: space,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -573,6 +583,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        heap_usage: false,
     }
 }
 

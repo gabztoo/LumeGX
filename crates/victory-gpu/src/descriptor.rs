@@ -148,6 +148,124 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Per list: the heap-usage bitmap in which shaders that take views from
+/// the view heap `heap` mark the slots they read (`victory_shader::emit`,
+/// `HostShader::heap_usage`); the list keeps it. After the list ran,
+/// each marked slot whose view the host left null (a placed texture, see
+/// `host::HostHeap::mirror`) is made, so it reads from the next list on;
+/// the bitmap is cleared. Without `VICTORY_HEAP_USAGE=1` (or with no view heap)
+/// the marks are ignored.
+#[cfg(windows)]
+pub(crate) fn usage_bitmap(
+    list: &crate::host::HostList,
+    heap: usize,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
+    crate::host::name(&bitmap, || "heap slots read".into());
+    // SAFETY: our mapped buffer of at least `words` dwords.
+    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+    list.keep(&bitmap);
+    let data = data as usize;
+    list.defer_after(move || {
+        // SAFETY: the bitmap is mapped, kept by the list, and its run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        let on = victory_shader::emit::heap_usage_marks() && heap != 0;
+        if heap == 0 {
+            USAGE[2].fetch_add(1, Relaxed);
+        }
+        let used = take_marked(marks);
+        if !on || used.is_empty() {
+            return;
+        }
+        let made = make_used(heap, &used);
+        USAGE[0].fetch_add(used.len() as u64, Relaxed);
+        USAGE[1].fetch_add(made, Relaxed);
+    });
+    Some(bitmap)
+}
+
+/// The slots heap-usage bitmap `marks` has bits set for, in order; the
+/// bitmap is left cleared.
+#[cfg(windows)]
+fn take_marked(marks: &mut [u32]) -> Vec<u32> {
+    let mut used = Vec::new();
+    for (w, mark) in marks.iter_mut().enumerate() {
+        if *mark == 0 {
+            continue;
+        }
+        let mut bits = std::mem::take(mark);
+        while bits != 0 {
+            used.push((w * 32) as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+    used
+}
+
+/// Heap slots marked read, views made for them, lists that marked with no
+/// view heap, and marks on a heap not registered or without a host heap,
+/// since the last call.
+#[cfg(windows)]
+pub(crate) fn take_usage() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| USAGE[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+#[cfg(windows)]
+static USAGE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Placed-texture views made for heap reads so far (the textures are never
+/// released).
+#[cfg(windows)]
+pub(crate) static MADE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Title textures whose views [`usage_bitmap`]'s marks made, for the next
+/// list that marks to upload ([`take_made`]): nothing else reads them
+/// through a table, which is where a texture is uploaded.
+#[cfg(windows)]
+static MADE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// The title textures made for heap reads since the last call, to upload.
+/// shortcut: each is uploaded once, by the first list that marks after it
+/// was made; what the title writes in its memory later is not seen (unless
+/// a draw reads it through a table). Upstream keeps every heap texture up
+/// to date at each submission (`bindless.rs`, c75fdba), not in this tree.
+#[cfg(windows)]
+pub(crate) fn take_made() -> Vec<usize> {
+    std::mem::take(&mut *MADE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Makes the views of slots `used` of the title view heap `heap` that the
+/// host left null for later (placed textures); how many it made.
+#[cfg(windows)]
+fn make_used(heap: usize, used: &[u32]) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        USAGE[3].fetch_add(used.len() as u64, Relaxed);
+        return 0;
+    }
+    // SAFETY: registered heaps are live (removed when dropped).
+    let h = unsafe { &*(heap as *const Heap) };
+    let (Some(Some(host)), Some(step)) = (h.host.get(), increment(h.desc.kind)) else {
+        USAGE[3].fetch_add(used.len() as u64, Relaxed);
+        return 0;
+    };
+    let step = u64::from(step);
+    let mut made = Vec::new();
+    for &index in used {
+        if let Some(texture) = host.make_placed(index, h.start + u64::from(index) * step) {
+            made.push(texture);
+        }
+    }
+    drop(heaps);
+    MADE_TOTAL.fetch_add(made.len() as u64, Relaxed);
+    let n = made.len() as u64;
+    MADE.lock().unwrap_or_else(|e| e.into_inner()).extend(made);
+    n
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -789,5 +907,18 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod usage_tests {
+    /// Each marked slot comes out once, in order, and the bitmap is
+    /// cleared for the list's next run.
+    #[test]
+    fn marked_slots_come_out_once_and_the_bitmap_is_cleared() {
+        let mut marks = [1 << 3 | 1 << 31, 0, 1, 0];
+        assert_eq!(super::take_marked(&mut marks), [3, 31, 64]);
+        assert_eq!(marks, [0; 4]);
+        assert!(super::take_marked(&mut marks).is_empty());
     }
 }

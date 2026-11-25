@@ -12,6 +12,12 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the host binds the heap-usage bitmap: `u1` in this space
+/// ([`Shader::heap_used_handle`]).
+pub const MEMORY_SPACE: u32 = 2;
+/// Heap slots the heap-usage bitmap has a bit for (the title's view heaps
+/// hold up to 1,245,184).
+pub const HEAP_VIEWS: u32 = 1 << 21;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -67,6 +73,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The heap-usage bitmap's handle, once a heap slot is marked.
+    pub heap_used: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -123,6 +131,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            heap_used: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -263,6 +272,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the heap-usage bitmap (`u1` in [`MEMORY_SPACE`], a raw
+    /// buffer), made in the entry block.
+    pub fn heap_used_handle(&mut self) -> V {
+        if let Some(h) = self.heap_used {
+            return h;
+        }
+        let r = self.m.i32(1);
+        let bind = [r, r, self.m.i32(MEMORY_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.heap_used = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -346,6 +380,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.heap_used.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -430,7 +465,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            if !self.root_uavs.is_empty() || self.heap_used.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -441,14 +476,21 @@ impl Shader {
                     Some(s.m.md_value(f))
                 };
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                // (space, register): the root UAVs, then the bitmap.
+                let all: Vec<(u32, u32)> = self
+                    .root_uavs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .chain(self.heap_used.map(|_| (MEMORY_SPACE, 1)))
+                    .collect();
+                for (n, (space, register)) in all.into_iter().enumerate() {
                     // Globally coherent, counter, rasterizer ordered: none.
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         no(&mut self),
@@ -459,8 +501,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }

@@ -95,6 +95,9 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
     /// The pipeline of the last draw prepared runs the depth bounds test.
     depth_bounds: bool,
+    /// The heap-usage bitmap made for this list, by its view heap: the
+    /// table of one view of it (`crate::descriptor::usage_bitmap`).
+    heap_usage: Option<(usize, D3D12_GPU_DESCRIPTOR_HANDLE)>,
     /// The values sent to each stage for the next device-removed marker.
     #[cfg(feature = "diagnostics")]
     bound_user_data: Vec<BoundUserData>,
@@ -682,6 +685,37 @@ impl State {
                 return false;
             }
         }
+        for stage in &p.stages {
+            let Some(param) = stage.heap_used else {
+                continue;
+            };
+            let heap = self.heaps[0];
+            let table = match self.heap_usage {
+                Some((h, table)) if h == heap => Some(table),
+                _ => {
+                    // The list's first shader that marks: the placed
+                    // textures marks made since are uploaded before it.
+                    for texture in crate::descriptor::take_made() {
+                        readable_texture(list, texture, true);
+                    }
+                    self.usage_table(list, heap)
+                }
+            };
+            let Some(table) = table else {
+                once!("a shader marking heap slots dropped: no heap-usage bitmap");
+                self.drop_for("pipeline made, no heap-usage bitmap");
+                return false;
+            };
+            self.heap_usage = Some((heap, table));
+            // SAFETY: an open list; the slot is in the bound view heap.
+            unsafe {
+                if compute {
+                    l.SetComputeRootDescriptorTable(param, table);
+                } else {
+                    l.SetGraphicsRootDescriptorTable(param, table);
+                }
+            }
+        }
         true
     }
 
@@ -793,6 +827,20 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.note_dropped_writes();
         }
+    }
+
+    /// This list's heap-usage bitmap for view heap `heap`, as a table of one
+    /// raw view of it in a dynamic slot of that heap: bounded, so the marks
+    /// a shader skips, sent past its end, are discarded. `None` without a
+    /// view heap or a slot.
+    fn usage_table(&mut self, list: &HostList, heap: usize) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let title = (heap != 0).then(|| crate::descriptor::heap(heap as This))?;
+        let host = title.host()?;
+        let index = host.dynamic(1)?;
+        self.dynamic.push((std::ptr::from_ref(title) as usize, index, 1));
+        let bitmap = crate::descriptor::usage_bitmap(list, heap)?;
+        host.raw_uav_at(index, &bitmap, 0, victory_shader::emit::HEAP_VIEWS / 32);
+        Some(host.gpu(index))
     }
 
     /// Notes why the draw or dispatch being prepared is dropped, for the
@@ -1633,7 +1681,6 @@ fn readable(
     } else {
         crate::producers::read(view);
     }
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -1663,19 +1710,7 @@ fn readable(
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            // A view the title placed, in another format, in the memory of
-            // a texture the host writes: that texture's texels, copied on
-            // the host (title memory does not have them).
-            let aliased = placed.is_some()
-                && crate::resource::alias_of(*resource as This)
-                    .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
-            }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            readable_texture(list, *resource, placed.is_some());
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -1696,6 +1731,25 @@ fn readable(
         }
         _ => {}
     }
+}
+
+/// Makes title texture `resource` readable by shaders in `list`: a view
+/// the title `placed`, in another format, in the memory of a texture the
+/// host writes reads that texture's texels, copied on the host (title
+/// memory does not have them); otherwise a texture title memory feeds is
+/// uploaded (once per list). Then it is in the shader resource state.
+fn readable_texture(list: &HostList, resource: usize, placed: bool) {
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    let aliased = placed
+        && crate::resource::alias_of(resource as This)
+            .is_some_and(|source| crate::texture::alias(list, resource as This, source));
+    if !aliased
+        && let Some(t) = crate::resource::host_resource(resource as This)
+        && crate::texture::title_written(t)
+    {
+        crate::texture::upload(list, resource as This, t);
+    }
+    crate::list::ensure_state(list, resource as This, SHADER_RESOURCE);
 }
 
 /// A view in a few words (diagnostics builds).
