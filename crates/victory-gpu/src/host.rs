@@ -1636,12 +1636,15 @@ impl Meter {
             );
             // Totals since the last of these lines, not per frame.
             let [exhausted, fragmented] = crate::descriptor::host::take_refused();
+            let [capacity, in_use, peak] = crate::descriptor::host::take_occupancy();
             tracing::info!(
                 "dynamic descriptor slots: {} tables refused ({exhausted} with fewer free slots \
                  than they need, {fragmented} with enough but no run that long), {} draws or \
-                 dispatches dropped for them",
+                 dispatches dropped for them; {in_use} of {capacity} taken (at most {peak}); {} \
+                 tables made afresh for reaching past the mirrored slots",
                 exhausted + fragmented,
-                crate::draw::take_table_drops()
+                crate::draw::take_table_drops(),
+                crate::draw::take_past_mirrored()
             );
             #[cfg(feature = "diagnostics")]
             {

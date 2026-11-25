@@ -120,6 +120,13 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Tables made afresh because they reach past the slots a capped host heap
+/// mirrors (they have no host slots of their own), since the last call.
+pub(crate) fn take_past_mirrored() -> u64 {
+    PAST_MIRRORED.swap(0, Ordering::Relaxed)
+}
+static PAST_MIRRORED: AtomicU64 = AtomicU64::new(0);
+
 /// Draws, mesh dispatches and dispatches dropped because a dynamic table of
 /// theirs was refused, since the last call.
 pub(crate) fn take_table_drops() -> u64 {
@@ -776,6 +783,7 @@ impl State {
                 continue;
             };
             if index >= host.count() {
+                PAST_MIRRORED.fetch_add(1, Ordering::Relaxed);
                 fresh.push(u.slot);
             }
         }

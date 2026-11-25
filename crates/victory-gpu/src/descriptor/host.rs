@@ -137,6 +137,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        CAPACITY.fetch_add(u64::from(extra), Ordering::Relaxed);
         let h = HostHeap {
             heap,
             cpu,
@@ -250,6 +251,19 @@ pub(crate) fn take_refused() -> [u64; 2] {
     [0, 1].map(|i| REFUSED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Dynamic slots of all view heaps: in all, taken now, and the most taken
+/// at once since the last [`take_occupancy`].
+static CAPACITY: AtomicU64 = AtomicU64::new(0);
+static IN_USE: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Dynamic slots in all, taken now and taken at most since the last call.
+pub(crate) fn take_occupancy() -> [u64; 3] {
+    let now = IN_USE.load(Ordering::Relaxed);
+    let peak = PEAK.swap(now, Ordering::Relaxed).max(now);
+    [CAPACITY.load(Ordering::Relaxed), now, peak]
+}
+
 /// `VICTORY_DESCRIPTOR_POOL=legacy`: dynamic tables are searched and sized
 /// as before upstream #974 and #1349 (no run across the search cursor, a
 /// fresh table from entry 0), for A/B runs with one binary. It changes no
@@ -339,6 +353,8 @@ impl HostHeap {
         };
         taken[first..first + n].fill(true);
         *free -= n;
+        let in_use = IN_USE.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        PEAK.fetch_max(in_use, Ordering::Relaxed);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -361,7 +377,9 @@ impl HostHeap {
         let (_, taken, free) = &mut *guard;
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = taken.get_mut(at as usize..end) {
-            *free += slots.iter().filter(|&&held| held).count();
+            let held = slots.iter().filter(|&&held| held).count();
+            *free += held;
+            IN_USE.fetch_sub(held as u64, Ordering::Relaxed);
             slots.fill(false);
         }
     }
