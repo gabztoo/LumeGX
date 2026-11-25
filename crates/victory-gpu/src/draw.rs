@@ -124,6 +124,15 @@ impl Drop for State {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Root UAVs bound through a copy of their own window (off 16 bytes of
+/// their buffer's copy), since the last call.
+static MISALIGNED_ROOT_UAVS: AtomicU64 = AtomicU64::new(0);
+
+/// [`MISALIGNED_ROOT_UAVS`], counted again from 0.
+pub(crate) fn take_misaligned_root_uavs() -> u64 {
+    MISALIGNED_ROOT_UAVS.swap(0, Ordering::Relaxed)
+}
+
 /// Lists that brought a heap's buffers up to date for programs reading the
 /// heap itself, and the ranges they did, since the last call.
 static HEAP_REFRESHES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -998,15 +1007,26 @@ impl State {
             return None;
         }
         // Raw views start on 16 bytes; one starting below the address would
-        // shift every access the shader makes from it.
-        // shortcut: such a root UAV is not bound (its draw or dispatch is
-        // dropped); pass the start's misalignment to the shader to add to
-        // its offsets if those passes matter.
-        let offset = shadow.offset(address);
+        // shift every access the shader makes from it. A root UAV off 16
+        // bytes of its buffer's copy gets a copy of its own window instead,
+        // starting at the address (as a view off its copy's elements does,
+        // `shadow::aligned`), brought up to date and copied back the same.
+        // shortcut: that copy is the 1 MiB window only, where the aligned
+        // case views the rest of the buffer; within a submission it does not
+        // see what shaders write in that range through the buffer's copy.
+        let mut shadow = shadow;
+        let mut left = shadow.left(address);
+        let mut offset = shadow.offset(address);
         if offset % 16 != 0 {
-            once!(offset, "a root UAV not on 16 bytes of its host copy");
-            self.drop_for("pipeline made, root UAV not on 16 bytes of its host copy");
-            return None;
+            let Some(own) = crate::shadow::aligned(address, left.min(1 << 20)) else {
+                once!(offset, "a root UAV not on 16 bytes of its host copy, and no copy of its own");
+                self.drop_for("pipeline made, root UAV not on 16 bytes and no copy of its own");
+                return None;
+            };
+            MISALIGNED_ROOT_UAVS.fetch_add(1, Ordering::Relaxed);
+            left = own.left(address);
+            offset = 0;
+            shadow = own;
         }
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
@@ -1018,7 +1038,6 @@ impl State {
             return None;
         };
         self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
-        let left = shadow.left(address);
         let elements = u32::try_from(left / 4).unwrap_or(u32::MAX);
         host.raw_uav_at(index, &shadow.buffer, offset / 4, elements);
         let len = left.min(1 << 20);
