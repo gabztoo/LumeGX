@@ -93,11 +93,14 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod user_table_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use lower::{host_max_wave, set_host_max_wave, wave_why};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 

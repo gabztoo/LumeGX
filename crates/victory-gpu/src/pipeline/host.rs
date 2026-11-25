@@ -474,6 +474,12 @@ impl HostPipeline {
                         .and_then(|(s, _)| s.translated())
                         .and_then(|t| wave_lanes(&t.host.dxil));
                     tracing::warn!(error = %e, ?shaders, ?wave_lanes, "host pipeline refused");
+                    // (diagnostics: kept with the untranslated ones, for
+                    // `victory translate --pipelines` offline)
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((s, _)) = stages.first() {
+                        super::dump_untranslated(s);
+                    }
                     host.log_messages();
                     return None;
                 }

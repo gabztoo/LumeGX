@@ -152,7 +152,17 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => {
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are
+            // at most 32 lanes (what the host device reports in a run).
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs)
+        }
         Command::Run {
             exe,
             unimplemented,

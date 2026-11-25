@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -190,6 +190,13 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// A console wave64 compute program run in host waves of 32 whose
+    /// cross-lane code stays inside 32-lane halves: the LDS dword of the
+    /// counter that hands each host wave its console threads
+    /// ([`Self::wave_base`]).
+    halves: Option<u32>,
+    /// The first console thread of this host wave, made in the entry block.
+    wave_base: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -285,6 +292,91 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Guards or lane-branch conditions that read a lane mask held as a number
+/// or a constant set of lanes: the lane tests its own bit by its console
+/// lane.
+fn lane_constant_masks(st: &Structured) -> bool {
+    let whens = st.exits.iter().filter_map(|e| match *e {
+        LaneExit::Branch { when, .. } => Some(when),
+        _ => None,
+    });
+    let mut all: Vec<Bool> = st
+        .guards
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .chain(whens)
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all.into_iter().any(|g| {
+        st.bools
+            .support(g)
+            .iter()
+            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+    })
+}
+
+/// What ties instruction `i` of a console wave64 program to the other
+/// 32-lane half of its wave: lane counts below a lane, reads and writes of
+/// a given lane, LDS permutes, lane masks read as numbers. `ds_swizzle`,
+/// DPP rows and `v_permlane16` / `v_permlanex16` stay inside a half by the
+/// ISA.
+fn crosses_halves(st: &Structured, i: &Inst) -> Option<&'static str> {
+    let n = i.name();
+    Some(if n.starts_with("v_mbcnt") {
+        "v_mbcnt"
+    } else if n == "v_readlane_b32" {
+        "v_readlane"
+    } else if n == "v_writelane_b32" {
+        "v_writelane"
+    } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+        "ds_(b)permute"
+    } else if reads_mask_as_data(st, i) {
+        "mask as data"
+    } else {
+        return None;
+    })
+}
+
+/// The widest wave the host GPU runs (0: not known, no host-specific
+/// forms); see [`set_host_max_wave`].
+static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets the host GPU's `WaveLaneCountMax`. At 32, console wave64 compute
+/// programs whose cross-lane code stays inside 32-lane halves run in host
+/// waves of 32 instead of declaring `WaveSize(64)`, which such a host
+/// refuses. Part of the translation: a shader cache must key on it.
+pub fn set_host_max_wave(lanes: u32) {
+    HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_host_max_wave`].
+pub fn host_max_wave() -> u32 {
+    #[cfg(test)]
+    if let Some(lanes) = TEST_HOST_WAVE.get() {
+        return lanes;
+    }
+    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's host wave size, for its thread only ([`set_host_max_wave`]
+    /// is the process's).
+    pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_WHY=1`: a line on stderr per console wave64 program that
+/// keeps 64-lane waves on a 32-lane host, with what ties it to them.
+/// Logging only; the shader cache keys on it so that such a run
+/// translates instead of reading earlier translations.
+pub fn wave_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WHY").is_some_and(|v| v == "1"))
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -361,6 +453,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut halves = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -375,32 +468,52 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            }) || lane_constant_masks(x.st);
+            let mut wave = if x.native.wave64 { 64 } else { 32 };
+            let group = cs.threads.iter().product::<u32>();
+            let one_wave = group <= wave;
+            // A host whose waves are at most 32 lanes (NVIDIA) refuses
+            // `WaveSize(64)`. A console wave64 program whose cross-lane code
+            // stays inside 32-lane halves runs exactly in waves of 32: each
+            // host wave takes one half of a console wave (`wave_base`). Not
+            // when it crosses halves ([`crosses_halves`], lane-constant
+            // masks), nor with LDS in a group over 32 threads, which the
+            // console may share within its wave without barriers.
+            if wave == 64
+                && host_max_wave() == 32
+                && (console_lanes || one_wave && s.lds_dwords > 0)
+            {
+                let crosses = insts().any(|i| crosses_halves(x.st, i).is_some())
+                    || lane_constant_masks(x.st);
+                let lds_over_32 = s.lds_dwords > 0 && group > 32;
+                if !crosses && !lds_over_32 {
+                    wave = 32;
+                } else if wave_why() {
+                    let mut why: Vec<&str> = Vec::new();
+                    for r in insts().filter_map(|i| crosses_halves(x.st, i)) {
+                        if !why.contains(&r) {
+                            why.push(r);
+                        }
+                    }
+                    if lane_constant_masks(x.st) {
+                        why.push("lane-constant mask");
+                    }
+                    if lds_over_32 {
+                        why.push("LDS in a group over 32");
+                    }
+                    why.sort_unstable();
+                    eprintln!(
+                        "WAVE64-WHY group={group} lds={} [{}]",
+                        s.lds_dwords > 0,
+                        why.join(", ")
+                    );
+                }
+            }
+            if wave == 32 && x.native.wave64 {
+                // the LDS dword `wave_base` hands host waves their threads from
+                halves = Some(s.lds_dwords);
+                s.lds_dwords += 1;
+            }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -487,6 +600,8 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            halves,
+            wave_base: None,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -1892,6 +2007,11 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
+        if let Some(base) = self.wave_base() {
+            let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let f = self.s.m.bin(e, Bin::Add, base, lane);
+            return self.split_flat(f, x, y, c);
+        }
         let flat = self.s.op(
             e,
             "flattenedThreadIdInGroup.i32",
@@ -1913,6 +2033,13 @@ impl<'a> Lower<'a> {
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
         let f = self.s.m.bin(e, Bin::Add, base, lane);
+        self.split_flat(f, x, y, c)
+    }
+
+    /// Component `c` of the thread id of flat thread index `f` in a group
+    /// `x` by `y` wide (in the entry block).
+    fn split_flat(&mut self, f: V, x: u32, y: u32, c: u8) -> Val {
+        let e = self.s.entry;
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
@@ -1923,6 +2050,46 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// A console wave64 program in host waves of 32 ([`Self::halves`]):
+    /// the first console thread of this host wave (0, 32, 64, ...). A GPU
+    /// need not give a host wave consecutive thread indices, so each wave
+    /// takes the next 32 from an LDS counter instead: every thread zeroes
+    /// it, the group meets, each wave's first lane adds 32 and the wave
+    /// takes what that lane found. Branch-free, in the entry block, which
+    /// every thread runs.
+    fn wave_base(&mut self) -> Option<V> {
+        let slot = self.halves?;
+        if let Some(v) = self.wave_base {
+            return Some(v);
+        }
+        let (e, i32t, void) = (self.s.entry, self.s.t.i32, self.s.t.void);
+        let lds = self.s.lds();
+        let k = self.s.m.i32(slot);
+        let zero = self.s.m.i32(0);
+        let ptr = self.s.m.element(e, lds, k);
+        self.s.m.store(e, ptr, zero);
+        // thread-group sync with a shared-memory fence
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        let k32 = self.s.m.i32(32);
+        let add = self.s.m.select(e, first, k32, zero);
+        let ptr = self.s.m.element(e, lds, k);
+        let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+        let base = self.s.op(
+            e,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[old],
+        );
+        self.s.flags |= flags::WAVE_OPS;
+        self.wave_base = Some(base);
+        Some(base)
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -2217,7 +2384,6 @@ impl<'a> Lower<'a> {
                 let keep = self.s.m.bin(c, Bin::Xor, mask, all);
                 let x = self.s.m.bin(c, Bin::And, x, ones);
                 let x = self.s.m.bin(c, Bin::Shl, x, shift);
-                use super::bitcode::Rmw;
                 let at = self.begin_guarded(guard);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
