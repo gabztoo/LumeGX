@@ -326,6 +326,10 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
     /// The host pipeline runs the title's depth bounds test.
     pub(crate) depth_bounds: bool,
+    /// A graphics pipeline of the console's rectangle lists whose geometry
+    /// shader completes each rectangle (`victory_shader::emit::rectangle_gs`):
+    /// it draws them as triangles, one per rectangle.
+    pub(crate) rectangles: bool,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -585,6 +589,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 depth_bounds: false,
+                rectangles: false,
             });
         }
         let Some(g) = g else {
@@ -636,14 +641,33 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 depth_bounds,
+                rectangles: false,
             });
         }
 
+        // Rectangle lists: a geometry shader made for the vertex shader adds
+        // each rectangle's fourth corner, for indirect draws too (else
+        // direct draws expand them on the CPU from vertex inputs, see
+        // `draw`).
+        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+            (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+                Ok(gs) => gs,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                BytecodeLength: gs.len(),
+            },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -668,7 +692,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
             &state,
         );
         let made = if depth_bounds {
@@ -690,7 +714,7 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, depth_bounds, "host pipeline");
+        tracing::info!(?shaders, depth_bounds, rectangles = !gs.is_empty(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -712,6 +736,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             depth_bounds,
+            rectangles: !gs.is_empty(),
         })
     }
 }
@@ -808,6 +833,7 @@ fn graphics_depth_bounds_pipeline(
         root: Sub<*mut std::ffi::c_void>,
         vs: Sub<D3D12_SHADER_BYTECODE>,
         ps: Sub<D3D12_SHADER_BYTECODE>,
+        gs: Sub<D3D12_SHADER_BYTECODE>,
         blend: Sub<D3D12_BLEND_DESC>,
         mask: Sub<u32>,
         raster: Sub<D3D12_RASTERIZER_DESC>,
@@ -835,6 +861,7 @@ fn graphics_depth_bounds_pipeline(
         ),
         vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, d.VS),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, d.PS),
+        gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, d.BlendState),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, d.SampleMask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, d.RasterizerState),

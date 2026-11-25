@@ -136,6 +136,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: its maximum output vertices (triangles in, strips out).
+    pub gs: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -188,6 +190,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(max) = p.gs {
+        // Input primitive (triangle), output topology (triangle strip),
+        // stream mask, then whether it writes a position.
+        for (k, v) in [3u32, 5, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
