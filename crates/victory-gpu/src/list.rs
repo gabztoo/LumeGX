@@ -507,8 +507,9 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if dst.kind == FOOTPRINT {
+                read_back(list, &dst, (x, y, z), &src, source_box);
+            }
             return;
         };
         let mut from = src;
@@ -590,6 +591,195 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// A host read-back buffer a finished list's copy is read from.
+#[cfg(windows)]
+struct ReadBack(windows::Win32::Graphics::Direct3D12::ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for ReadBack {}
+// SAFETY: as above.
+#[cfg(windows)]
+unsafe impl Sync for ReadBack {}
+
+/// Texture to buffer (read back, the title reading GPU results on the CPU):
+/// the GPU copies the region into a read-back buffer of ours laid out as
+/// the title's footprint, rows pitched to the host's 256 bytes; after the
+/// list ran, the region's rows go to the title's buffer.
+/// shortcut: depth and stencil sources, and footprints whose elements are
+/// not the texture's size, are not read back (logged once); the title's
+/// buffer copy on the host, if it has one, is not brought up to date.
+#[cfg(windows)]
+fn read_back(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    (x, y, z): (u32, u32, u32),
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    macro_rules! skip {
+        ($why:literal) => {{
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(concat!("texture not read back: ", $why)));
+            return;
+        }};
+    }
+    let fp = dst.footprint;
+    if src.kind == FOOTPRINT {
+        skip!("a buffer to buffer copy through footprints");
+    }
+    let Some(texture) = crate::resource::host_resource(src.resource) else {
+        skip!("a source with no host texture");
+    };
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    let Some((element, block)) = crate::resource::element(fp.format) else {
+        skip!("a footprint format of unknown size");
+    };
+    if desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+        skip!("a depth or stencil source");
+    }
+    if crate::resource::element(desc.Format.0 as u32) != Some((element, block)) {
+        skip!("a footprint whose elements are not the texture's size");
+    }
+    // The region: the box, or the subresource from (x, y, z).
+    let (w, h, d) = if source_box.is_null() {
+        let mips = u32::from(desc.MipLevels.max(1));
+        let mip = (src.footprint.offset as u32) % mips;
+        let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            (u32::from(desc.DepthOrArraySize) >> mip).max(1)
+        } else {
+            1
+        };
+        (
+            ((desc.Width >> mip) as u32).max(1).min(fp.width.saturating_sub(x)),
+            (desc.Height >> mip).max(1).min(fp.height.saturating_sub(y)),
+            depth.min(fp.depth.saturating_sub(z)),
+        )
+    } else {
+        // SAFETY: the title's box: left, top, front, right, bottom, back.
+        let b = unsafe { *source_box };
+        (b[3].saturating_sub(b[0]), b[4].saturating_sub(b[1]), b[5].saturating_sub(b[2]))
+    };
+    let Some(bytes) = fp.bytes() else { return };
+    let Some(title) = buffer_range(dst.resource, fp.offset, bytes) else {
+        return;
+    };
+    if w == 0 || h == 0 || d == 0 || x % block as u32 != 0 || y % block as u32 != 0 {
+        skip!("an empty region or one off its format's blocks");
+    }
+    let pitch = u64::from(fp.row_pitch.next_multiple_of(256));
+    let lines = u64::from(fp.height).div_ceil(block);
+    let size = pitch * lines * u64::from(fp.depth.max(1));
+    let Some(host) = crate::host::host() else { return };
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let buffer_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of a read-back buffer.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &readback,
+            D3D12_HEAP_FLAG_NONE,
+            &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut buffer,
+        )
+    };
+    let (Ok(()), Some(buffer)) = (made, buffer) else {
+        skip!("no read-back buffer");
+    };
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let mut to = *dst;
+    to.resource = buffer.as_raw().cast_const().cast();
+    to.footprint.offset = 0;
+    to.footprint.format = desc.Format.0 as u32;
+    to.footprint.row_pitch = pitch as u32;
+    let mut from = *src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "read back {:?} f{} {w}x{h}x{d} at {x},{y},{z} to {title:p} pitch {}",
+            src.resource, desc.Format.0, fp.row_pitch
+        )
+    });
+    // SAFETY: an open list; both locations in the host's layout, naming
+    // live resources; the footprint fits the read-back buffer.
+    unsafe { list.list.CopyTextureRegion((&raw const to).cast(), x, y, z, (&raw const from).cast(), host_box) };
+    list.keep(&buffer);
+    READ_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let kept = ReadBack(buffer);
+    let (title, row_pitch) = (title as usize, u64::from(fp.row_pitch));
+    let (x, y, z) = (u64::from(x) / block, u64::from(y) / block, u64::from(z));
+    let (rows, run) = (u64::from(h).div_ceil(block), u64::from(w).div_ceil(block) * element);
+    list.defer_after(move || {
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: size as usize };
+        // SAFETY: our read-back buffer, which the finished list wrote.
+        if unsafe { kept.0.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+            return;
+        }
+        let copies: Vec<_> =
+            read_back_rows((x, y, z), (rows, run, u64::from(d)), (lines, row_pitch, pitch, element)).collect();
+        if let (Some(first), Some(last)) = (copies.first(), copies.last()) {
+            crate::watch::writing(title + first.0, last.0 + last.2 - first.0);
+        }
+        for (at, from, n) in copies {
+            // SAFETY: inside the mapped read-back buffer.
+            let host = unsafe { data.cast::<u8>().add(from) };
+            crate::host::write_mapped((title + at) as *mut u8, host, n);
+        }
+        // SAFETY: mapped above.
+        unsafe { kept.0.Unmap(0, None) };
+    });
+}
+
+/// The rows a read back copies, as (offset in the title's buffer, offset in
+/// the read-back buffer, bytes): from block `x`, row `y` of slice `z`,
+/// `rows` rows of `run` bytes in each of `slices` slices of a footprint of
+/// `lines` rows per slice, pitched `title_pitch` in the title's buffer and
+/// `host_pitch` in ours, `element` bytes per block.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn read_back_rows(
+    (x, y, z): (u64, u64, u64),
+    (rows, run, slices): (u64, u64, u64),
+    (lines, title_pitch, host_pitch, element): (u64, u64, u64, u64),
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    (z..z + slices).flat_map(move |slice| {
+        (y..y + rows).map(move |row| {
+            let line = slice * lines + row;
+            let column = x * element;
+            ((line * title_pitch + column) as usize, (line * host_pitch + column) as usize, run as usize)
+        })
+    })
+}
+
+/// Textures read back into title buffers since the last call.
+#[cfg(windows)]
+static READ_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`READ_BACK`], counted again from 0.
+#[cfg(windows)]
+pub(crate) fn take_read_back() -> u64 {
+    READ_BACK.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -1419,6 +1609,18 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A read back of 2x2 texels from (1, 1) of a 4x3 RGBA8 footprint the
+    /// title pitched at 16 bytes, read from our 256-byte pitched buffer:
+    /// each row lands at its own pitch, only the region's bytes.
+    #[test]
+    fn read_back_rows_follow_both_pitches() {
+        let rows: Vec<_> = read_back_rows((1, 1, 0), (2, 8, 1), (3, 16, 256, 4)).collect();
+        assert_eq!(rows, [(16 + 4, 256 + 4, 8), (32 + 4, 512 + 4, 8)]);
+        // A second slice starts after the footprint's rows of the first.
+        let rows: Vec<_> = read_back_rows((0, 0, 1), (1, 16, 1), (3, 16, 256, 4)).collect();
+        assert_eq!(rows, [(48, 768, 16)]);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
