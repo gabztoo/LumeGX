@@ -43,6 +43,16 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// The root data sent to the host for one stage of the current draw
+/// (diagnostics, for the device-removed report).
+#[cfg(feature = "diagnostics")]
+struct BoundUserData {
+    values: Vec<u32>,
+    /// Tables made afresh for it: (root slot, offset sent, first and end
+    /// entry made; entry `k` lies at slot `offset / 32 + k`).
+    rebuilt_tables: Vec<(u8, u32, u32, u32)>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -85,6 +95,9 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64, usize), u32>,
     /// The pipeline of the last draw prepared runs the depth bounds test.
     depth_bounds: bool,
+    /// The values sent to each stage for the next device-removed marker.
+    #[cfg(feature = "diagnostics")]
+    bound_user_data: Vec<BoundUserData>,
 }
 
 impl Drop for State {
@@ -458,6 +471,8 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            #[cfg(feature = "diagnostics")]
+            crate::producers::live_target(t);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
@@ -474,6 +489,12 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let record_bindings = crate::host::dred_on();
+        #[cfg(feature = "diagnostics")]
+        if record_bindings {
+            self.bound_user_data.clear();
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -513,6 +534,8 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::producers::set_reader(&p.name);
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -529,14 +552,15 @@ impl State {
                 }
                 return false;
             }
+            let mut values = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some(&(_, offset, ..)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -548,6 +572,10 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if record_bindings {
+                self.bound_user_data.push(BoundUserData { values, rebuilt_tables: made.clone() });
             }
             const CBV: u8 = 0;
             const SRV: u8 = 1;
@@ -629,6 +657,10 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         let _ran = self.run_dispatch(list, x, y, z);
+        #[cfg(feature = "diagnostics")]
+        if !_ran {
+            self.note_dropped_writes();
+        }
         // Traced once its tables are bound: compute writes through them.
         #[cfg(feature = "diagnostics")]
         self.trace(
@@ -672,9 +704,10 @@ impl State {
     }
 
     /// What a draw or dispatch runs, for the device-removed report
-    /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (diagnostics): the pipeline, then per stage the user data it was
+    /// bound with (tables by where they are: rebuilt, in which heap and at
+    /// which slot, or unbound), the host addresses of its root views and the
+    /// title tables it reads.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -682,19 +715,11 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
-        let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten();
-        for stage in &p.stages {
+        for (stage, bound) in p.stages.iter().zip(&self.bound_user_data) {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
-                }
+                self.note_user_data(&mut text, compute, u, bound);
             }
             let views = stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs);
             for &(slot, _) in views {
@@ -705,7 +730,7 @@ impl State {
                 }
             }
         }
-        let _ = write!(text, " tables {:?}", self.reads(compute));
+        let _ = write!(text, " title tables {:?}", self.reads(compute));
         text
     }
 
@@ -730,6 +755,41 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
+        }
+    }
+
+    /// Diagnostics (`VICTORY_PRODUCERS=1`): what the dropped draw or
+    /// dispatch bound now would have written, for [`crate::producers`].
+    #[cfg(feature = "diagnostics")]
+    fn note_dropped_writes(&self) {
+        if !crate::producers::on() {
+            return;
+        }
+        let mut writer = String::new();
+        for (stage, hash, used) in crate::pipeline::native_used(self.pipeline as This) {
+            let compute = stage == "compute";
+            if writer.is_empty() || stage == "pixel" || compute {
+                writer = format!("{stage} {hash}");
+            }
+            for u in used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(view) = crate::descriptor::view(handle) {
+                    crate::producers::dropped_write(&format!("{stage} {hash}"), &view);
+                }
+            }
+        }
+        if !writer.starts_with("compute") {
+            for &t in &self.targets {
+                crate::producers::dropped_target(&writer, t);
+            }
         }
     }
 
@@ -836,6 +896,68 @@ impl State {
         Some(host.gpu(index))
     }
 
+    /// One user-data value as bound, for [`State::op_text`]: a table's by
+    /// where it is (rebuilt for this draw, or the heap and slot it starts
+    /// at, with that slot's host view; for a view the host never made, what
+    /// the title's heap memory holds there).
+    #[cfg(feature = "diagnostics")]
+    fn note_user_data(
+        &self,
+        text: &mut String,
+        compute: bool,
+        data: &victory_shader::emit::UserData,
+        bound: &BoundUserData,
+    ) {
+        use std::fmt::Write;
+        let Some(&value) = bound.values.get(data.index as usize) else {
+            return;
+        };
+        let _ = write!(text, " u{}={value:#x}", data.index);
+        if data.root != RootType::Table {
+            return;
+        }
+        if let Some(&(_, _, start, end)) = bound.rebuilt_tables.iter().find(|r| r.0 == data.slot) {
+            // Rebuilt tables use dynamic view slots, which have no mirror
+            // record. The offset is in 32-byte console view descriptors;
+            // trimmed to entries `start..end` (#1349), they hold only
+            // slots `base + start..base + end`.
+            let base = value / 32;
+            let _ = write!(text, " [rebuilt view table base {base}, slots {}..{}]", base + start, base + end);
+            return;
+        }
+        let table = match self.roots_ref(compute).get(usize::from(data.slot)) {
+            Some(Root::Table(handle)) => self
+                .heap_of(*handle)
+                .and_then(|heap| heap.index(*handle).map(|index| (heap, index))),
+            _ => None,
+        };
+        let Some((heap, index)) = table else {
+            text.push_str(" [unbound table]");
+            return;
+        };
+        let kind = if heap.samplers() { "sampler" } else { "view" };
+        let _ = write!(text, " [{kind} table base {index}");
+        if let Some(record) = heap.host().and_then(|h| h.describe_slot(index)) {
+            let _ = write!(text, ": {record}");
+            // A view the host never made: what the title's memory holds
+            // there (our record, zeros, or words it wrote itself).
+            if record == "null" && !heap.samplers() {
+                let at = heap.start + u64::from(index) * 32;
+                let mut words = [0u8; 32];
+                if crate::host::read_into(at as *const u8, &mut words) {
+                    let w: Vec<u32> =
+                        words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let _ = write!(text, " (title words {w:x?}");
+                    if let Some(view) = crate::descriptor::view(at) {
+                        let _ = write!(text, ": {}", describe(Some(&view)));
+                    }
+                    text.push(')');
+                }
+            }
+        }
+        text.push(']');
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -872,7 +994,12 @@ impl State {
     /// afresh once: the big tables the world binds would otherwise take
     /// hundreds of slots per draw, wrapping the dynamic slots onto lists not
     /// yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Vec<(u8, u32, u32, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -980,7 +1107,7 @@ impl State {
                         readable(list, u, &view, copy.as_ref());
                     }
                 }
-                made.push((slot, base * 32));
+                made.push((slot, base * 32, start, end));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -1016,7 +1143,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, base * 32));
+            made.push((slot, base * 32, start, end));
         }
         made
     }
@@ -1144,6 +1271,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 
@@ -1231,6 +1360,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            #[cfg(feature = "diagnostics")]
+            self.note_dropped_writes();
         }
     }
 }
@@ -1253,6 +1384,9 @@ impl State {
         // Traced once its tables are bound, as a dispatch is.
         #[cfg(feature = "diagnostics")]
         {
+            if !ran {
+                self.note_dropped_writes();
+            }
             let (kind, _, max) = signature;
             let what = || format!("indirect kind {kind} max {max}{}", if ran { "" } else { " DROPPED" });
             self.trace(what, kind == 2);
@@ -1406,6 +1540,12 @@ fn readable(
     view: &View,
     copy: Option<&std::sync::Arc<crate::shadow::Shadow>>,
 ) {
+    #[cfg(feature = "diagnostics")]
+    if u.kind == ResourceType::Uav {
+        crate::producers::live_write(view);
+    } else {
+        crate::producers::read(view);
+    }
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1641,5 +1781,28 @@ mod tests {
         assert_eq!(next, first + 4);
         heap.release(first, n);
         heap.release(next, 1);
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod breadcrumb_tests {
+    use super::*;
+    use victory_shader::emit::UserData;
+
+    /// The device-removed report names each user-data value as bound: a
+    /// constant by its value, a table rebuilt for the draw by its fresh
+    /// base, and a table slot the title never set as unbound (not as an
+    /// index into whatever heap is first).
+    #[test]
+    fn breadcrumbs_distinguish_constants_rebuilt_tables_and_missing_tables() {
+        let mut state = State::default();
+        state.set_table(false, 1, 0x1000);
+        let bound = BoundUserData { values: vec![0x1234, 0x8000, 0], rebuilt_tables: vec![(1, 0x8000, 120, 124)] };
+        let mut text = String::new();
+        for (index, root) in [(0, RootType::Constants), (1, RootType::Table), (2, RootType::Table)] {
+            let data = UserData { index, slot: index as u8, root, dword: 0 };
+            state.note_user_data(&mut text, false, &data, &bound);
+        }
+        assert_eq!(text, " u0=0x1234 u1=0x8000 [rebuilt view table base 1024, slots 1144..1148] u2=0x0 [unbound table]");
     }
 }
