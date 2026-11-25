@@ -124,6 +124,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_SHADER_DUMP=1` | writes the title's shaders that do not translate to `untranslated` in the cache folder, for `victory translate` and `victory shader-info --disasm` (outside the repository; never commit them) |
+| `VICTORY_DUMP_SHADERS=<hash>,...` | writes these shaders (16-digit hashes as the logs print them) to the same folder even when they translate, e.g. the ones a device-removed report names |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_DEPTH_BOUNDS=0` | the title's depth bounds test is left out (pipelines without it, the bounds lists set ignored), as before it was supported; the log line `depth bounds: ... draws/frame with the test` says how many draws use it |

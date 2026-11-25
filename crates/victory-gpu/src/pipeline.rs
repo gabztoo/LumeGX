@@ -127,6 +127,10 @@ impl Shader {
                         dump_untranslated(self);
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                if done.is_ok() && dump_listed(&self.hash) {
+                    dump_untranslated(self);
+                }
                 done.ok()
             })
             .as_ref()
@@ -216,9 +220,10 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
+/// Shader hashes as printed in the pipeline diagnostics, from the value of
+/// the variable `name`.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_hashes(name: &str, value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -227,10 +232,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
+                tracing::warn!(hash, "{name} expects 16-digit shader hashes");
                 None
             }
         })
@@ -242,7 +244,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_hashes("VICTORY_SKIP_PIPELINES", &value)
     });
     if hashes.is_empty() {
         return None;
@@ -530,6 +532,22 @@ pub fn dump_untranslated_to(dir: std::path::PathBuf) {
     let _ = UNTRANSLATED.set(dir);
 }
 
+/// `VICTORY_DUMP_SHADERS=<hash>,...` (diagnostics): these shaders are
+/// written with the untranslated ones even when they translate, for
+/// `victory shader-info --disasm` (the shader cache keeps translations,
+/// not the title's containers).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_listed(hash: &str) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES
+        .get_or_init(|| {
+            let value = std::env::var("VICTORY_DUMP_SHADERS").unwrap_or_default();
+            parse_hashes("VICTORY_DUMP_SHADERS", &value)
+        })
+        .iter()
+        .any(|h| h == hash)
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn dump_untranslated(shader: &Shader) {
     let Some(dir) = UNTRANSLATED.get() else { return };
@@ -546,9 +564,12 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_hashes("VICTORY_SKIP_PIPELINES", " , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_hashes(
+                "VICTORY_SKIP_PIPELINES",
+                " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"
+            ),
             ["0123456789abcdef", "0011223344556677"]
         );
     }
