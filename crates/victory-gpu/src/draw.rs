@@ -71,8 +71,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
+    /// Tables made afresh in this list: (table, what its used range holds) →
+    /// virtual slot 0 (`first_dynamic - start_entry`), so entry `k` lies at
+    /// `base + k`.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
@@ -118,6 +119,20 @@ static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
+
+/// Tables made afresh because they reach past the slots a capped host heap
+/// mirrors (they have no host slots of their own), since the last call.
+pub(crate) fn take_past_mirrored() -> u64 {
+    PAST_MIRRORED.swap(0, Ordering::Relaxed)
+}
+static PAST_MIRRORED: AtomicU64 = AtomicU64::new(0);
+
+/// Draws, mesh dispatches and dispatches dropped because a dynamic table of
+/// theirs was refused, since the last call.
+pub(crate) fn take_table_drops() -> u64 {
+    TABLE_DROPS.swap(0, Ordering::Relaxed)
+}
+static TABLE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
@@ -475,6 +490,7 @@ impl State {
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                TABLE_DROPS.fetch_add(1, Ordering::Relaxed);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -767,6 +783,7 @@ impl State {
                 continue;
             };
             if index >= host.count() {
+                PAST_MIRRORED.fetch_add(1, Ordering::Relaxed);
                 fresh.push(u.slot);
             }
         }
@@ -793,30 +810,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            let (start, end) = fresh_table_range(&entries, host.count());
+            // From entry 0, as before #1349, in the legacy arm of an A/B.
+            let start = if crate::descriptor::host::legacy_pool() { 0 } else { start };
+            let n = end - start;
+            // The table slice and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
+                start.hash(&mut h);
+                end.hash(&mut h);
+                for k in start..end {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, base * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -828,13 +846,14 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let base = first - start;
+            self.fresh_tables.insert(key, base);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
+            // The whole used range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            for k in start..end {
+                let index = base + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
@@ -859,7 +878,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, base * 32));
         }
         made
     }
@@ -1382,5 +1401,78 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
         DEPTH_BOUNDS[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The `[start, end)` descriptor slot range a fresh table needs for `entries`,
+/// clamped so `start <= mirrored` (ensuring `first - start` never underflows
+/// for any dynamic slot `first >= mirrored`).
+fn fresh_table_range(entries: &[&UsedResource], mirrored: u32) -> (u32, u32) {
+    let start = entries
+        .iter()
+        .map(|u| u.table_offset_dwords / 8)
+        .min()
+        .unwrap_or(0)
+        .min(mirrored);
+    let end = entries
+        .iter()
+        .map(|u| u.table_offset_dwords / 8 + 1)
+        .max()
+        .unwrap_or(1)
+        .max(start + 1);
+    (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn used_at(offset_dwords: u32) -> UsedResource {
+        UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: offset_dwords,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }
+    }
+
+    /// Fresh tables reserve only from their first used entry to their last,
+    /// shifting the table's virtual slot 0 so shader heap indexing lands on
+    /// the exact allocated dynamic slots without underflow.
+    #[test]
+    fn fresh_tables_start_at_their_first_used_entry() {
+        let a = used_at(120 * 8);
+        let b = used_at(123 * 8);
+        let entries = [&a, &b];
+        assert_eq!(fresh_table_range(&entries, 737_856), (120, 124));
+
+        // On a tiny mirrored prefix, `start` clamps to `mirrored` so
+        // `first - start` never underflows.
+        assert_eq!(fresh_table_range(&entries, 4), (4, 124));
+
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 256) else {
+            return; // no host GPU
+        };
+        let (start, end) = fresh_table_range(&entries, heap.count());
+        let n = end - start;
+        assert_eq!((start, end, n), (120, 124, 4));
+
+        let first = heap.dynamic(n).expect("dynamic slots available");
+        let base = first - start;
+        let user_data_offset = base * 32;
+        // Translated shaders compute `(user_data + table_offset_dwords * 4) >> 5`.
+        let index_a = user_data_offset.wrapping_add(a.table_offset_dwords * 4) >> 5;
+        let index_b = user_data_offset.wrapping_add(b.table_offset_dwords * 4) >> 5;
+        assert_eq!(index_a, first);
+        assert_eq!(index_b, first + 3);
+        // Only 4 dynamic slots were consumed, not 124.
+        let next = heap.dynamic(1).expect("next dynamic slot");
+        assert_eq!(next, first + 4);
+        heap.release(first, n);
+        heap.release(next, 1);
     }
 }

@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -20,7 +21,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`]; a heap capped at
+    /// [`PORTABLE_VIEWS`] keeps [`capped_dynamic`] of its slots.
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -30,9 +32,9 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset), and how many are free.
+    next: Mutex<(u32, Vec<bool>, usize)>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -70,8 +72,41 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// but takes these on top of every title slot.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Splits a capped view heap of `limit` host descriptors into
+/// `(mirrored_title_slots, dynamic_slots)`, keeping at least one mirrored
+/// slot when `limit > 1`.
+fn capped_split(limit: u32, dynamic: u32) -> (u32, u32) {
+    let dynamic = dynamic.min(limit.saturating_sub(1));
+    (limit - dynamic, dynamic)
+}
+
+/// The dynamic slots a view heap capped at [`PORTABLE_VIEWS`] keeps:
+/// [`DYNAMIC`], so the world's tables have the same room as on a host that
+/// takes the title's whole heap; title slots past the rest have no host
+/// slot, and tables reaching them are made afresh in dynamic slots.
+/// `VICTORY_CAPPED_DYNAMIC=<n>` keeps `n` instead (65536 is the split
+/// before, for A/B runs); it changes no translation.
+fn capped_dynamic() -> u32 {
+    static DYNAMIC_SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DYNAMIC_SLOTS.get_or_init(|| {
+        let Ok(value) = std::env::var("VICTORY_CAPPED_DYNAMIC") else {
+            return DYNAMIC;
+        };
+        match value.trim().parse() {
+            Ok(n) => {
+                tracing::warn!(n, "VICTORY_CAPPED_DYNAMIC: dynamic slots of a capped view heap");
+                n
+            }
+            Err(_) => {
+                tracing::warn!(value, "VICTORY_CAPPED_DYNAMIC expects a number of slots");
+                DYNAMIC
+            }
+        }
+    })
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -109,10 +144,17 @@ impl HostHeap {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    // shortcut: descriptors past the mirrored part have no
+                    // host slot; tables reaching them are made afresh.
+                    let (mirrored, dynamic) = capped_split(PORTABLE_VIEWS, capped_dynamic());
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        mirrored,
+                        dynamic,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, mirrored, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -136,6 +178,7 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        CAPACITY.fetch_add(u64::from(extra), Ordering::Relaxed);
         let h = HostHeap {
             heap,
             cpu,
@@ -145,7 +188,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; extra as usize], extra as usize)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -204,6 +247,108 @@ impl HostHeap {
     }
 }
 
+/// The first run of `n` free slots in cursor order: a run starting at
+/// `cursor` or after it, else one starting before it, which may cross the
+/// cursor but not wrap past the end. Upstream #974's search, kept apart from
+/// [`HostHeap::dynamic`] so every small pattern can be checked against an
+/// oracle. Without `cross`, runs crossing the cursor are missed, as before
+/// #974 (`VICTORY_DESCRIPTOR_POOL=legacy`).
+fn free_run(taken: &[bool], cursor: usize, n: usize, cross: bool) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    // Search from `cursor` on, then from the start (extending past cursor by
+    // n - 1 so contiguous runs crossing the cursor are not missed).
+    let end = taken.len();
+    let second_end = if cross {
+        cursor.saturating_add(n.saturating_sub(1)).min(end)
+    } else {
+        cursor.min(end)
+    };
+    let starts = (cursor..end).chain(0..second_end);
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in starts {
+        // A run cannot wrap past the end.
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            return Some(at + 1 - n);
+        }
+    }
+    None
+}
+
+/// Dynamic tables refused since the last [`take_refused`]: with fewer free
+/// slots than they need (exhaustion), and with enough free slots but no
+/// run that long (fragmentation).
+static REFUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`REFUSED`], counted again from 0.
+pub(crate) fn take_refused() -> [u64; 2] {
+    [0, 1].map(|i| REFUSED[i].swap(0, Ordering::Relaxed))
+}
+
+/// Dynamic slots of all view heaps: in all, taken now, and the most taken
+/// at once since the last [`take_occupancy`].
+static CAPACITY: AtomicU64 = AtomicU64::new(0);
+static IN_USE: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Dynamic slots in all, taken now and taken at most since the last call.
+pub(crate) fn take_occupancy() -> [u64; 3] {
+    let now = IN_USE.load(Ordering::Relaxed);
+    let peak = PEAK.swap(now, Ordering::Relaxed).max(now);
+    [CAPACITY.load(Ordering::Relaxed), now, peak]
+}
+
+/// `VICTORY_DESCRIPTOR_POOL=legacy`: dynamic tables are searched and sized
+/// as before upstream #974 and #1349 (no run across the search cursor, a
+/// fresh table from entry 0), for A/B runs with one binary. It changes no
+/// translation, so the shader cache is shared by both arms.
+pub(crate) fn legacy_pool() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        let legacy =
+            std::env::var_os("VICTORY_DESCRIPTOR_POOL").is_some_and(|v| v == "legacy");
+        if legacy {
+            tracing::warn!(
+                "VICTORY_DESCRIPTOR_POOL=legacy: dynamic descriptor tables searched and sized \
+                 as before"
+            );
+        }
+        legacy
+    })
+}
+
+/// Free dynamic slots in all and the longest run of them (runs do not wrap
+/// past the end), for the report of a refused table.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
+}
+
+/// How to read a refused table of `n` slots from [`free_space`]: fewer free
+/// slots than `n` is the pool running out; enough free slots but no run of
+/// `n` is fragmentation; a free run of `n` refused is a fault of the search.
+fn refusal_kind(n: usize, free: usize, longest: usize) -> &'static str {
+    if longest >= n {
+        "search bug: a long enough free run was refused"
+    } else if free >= n {
+        "fragmentation: enough free slots, no run that long"
+    } else {
+        "exhaustion: fewer free slots than the table needs"
+    }
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -228,31 +373,29 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, free) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = free_run(taken, *next as usize, n, !legacy_pool()) else {
+            REFUSED[usize::from(*free >= n)].fetch_add(1, Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                // Still under the lock: the slots as the search saw them.
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    reading = refusal_kind(n, free, longest),
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
+        *free -= n;
+        let in_use = IN_USE.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        PEAK.fetch_max(in_use, Ordering::Relaxed);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -272,8 +415,12 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, taken, free) = &mut *guard;
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = taken.get_mut(at as usize..end) {
+            let held = slots.iter().filter(|&&held| held).count();
+            *free += held;
+            IN_USE.fetch_sub(held as u64, Ordering::Relaxed);
             slots.fill(false);
         }
     }
@@ -1106,6 +1253,104 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A capped view heap reserves the dynamic budget while keeping the
+    /// mirrored prefix intact, and small limits never underflow.
+    #[test]
+    fn capped_view_heap_reserves_dynamic_slots() {
+        assert_eq!(capped_split(PORTABLE_VIEWS, DYNAMIC), (737_856, 262_144));
+        assert_eq!(capped_split(PORTABLE_VIEWS, MIN_DYNAMIC), (934_464, 65_536));
+        assert_eq!(capped_split(1024, DYNAMIC), (1, 1023));
+        assert_eq!(capped_split(1, DYNAMIC), (1, 0));
+        assert_eq!(capped_split(0, DYNAMIC), (0, 0));
+    }
+
+    /// A title view heap larger than the portable limit keeps the full
+    /// dynamic budget whether the host caps it or takes the whole size.
+    #[test]
+    fn large_view_heap_keeps_full_dynamic_budget() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS + 250_000) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.dynamic, DYNAMIC);
+        assert!(heap.count() + heap.dynamic >= PORTABLE_VIEWS);
+        let first = heap.dynamic(DYNAMIC).expect("full dynamic range available");
+        assert_eq!(first, heap.count());
+        heap.release(first, DYNAMIC);
+    }
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
+
+    /// Every pattern of 8 slots, every cursor and size, against an oracle:
+    /// the first start in cursor order whose `n` slots are all free.
+    #[test]
+    fn free_run_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_run(&taken, cursor, n, true),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The refusal measured on this tree before #974: a pool of 2^16 with
+    /// only slots 0..10 free and the cursor at 5 refused a table of 10.
+    #[test]
+    fn a_table_of_the_free_slots_around_the_cursor_is_found() {
+        let mut taken = vec![true; 1 << 16];
+        taken[..10].fill(false);
+        assert_eq!(free_run(&taken, 5, 10, true), Some(0));
+        assert_eq!(free_run(&taken, 5, 11, true), None);
+        assert_eq!(free_space(&taken), (10, 10));
+        // The legacy arm of an A/B refuses it, as this tree did.
+        assert_eq!(free_run(&taken, 5, 10, false), None);
+    }
+
+    /// The free count a refusal is classified by follows takes and releases,
+    /// a release of slots not taken included.
+    #[test]
+    fn the_free_count_follows_takes_and_releases() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let counted = |heap: &HostHeap| {
+            let guard = heap.next.lock().unwrap();
+            (guard.2, guard.1.iter().filter(|&&held| !held).count())
+        };
+        let all = heap.dynamic as usize;
+        let a = heap.dynamic(7).unwrap();
+        let b = heap.dynamic(3).unwrap();
+        heap.release(a, 7);
+        heap.release(a, 7);
+        assert_eq!(counted(&heap), (all - 3, all - 3));
+        heap.release(b, 3);
+        assert_eq!(counted(&heap), (all, all));
+    }
+
+    #[test]
+    fn refusals_read_as_exhaustion_fragmentation_or_search_fault() {
+        assert!(refusal_kind(10, 9, 9).starts_with("exhaustion"));
+        assert!(refusal_kind(10, 30, 9).starts_with("fragmentation"));
+        assert!(refusal_kind(10, 30, 10).starts_with("search bug"));
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -1288,5 +1533,32 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_search_can_find_a_run_across_the_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let first = heap.dynamic(1).unwrap();
+        let left = heap.dynamic(2).unwrap();
+        let right = heap.dynamic(2).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
+        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
+
+        // Reallocating the left half puts the cursor back in the middle.
+        heap.release(left, 2);
+        assert_eq!(heap.dynamic(2), Some(left));
+        heap.release(left, 2);
+        heap.release(right, 2);
+        assert_eq!(heap.dynamic(4), Some(left));
+        assert_eq!(heap.dynamic(1), None);
+
+        // A free slot at each physical end does not form a two-slot range.
+        heap.release(first, 1);
+        let last = first + heap.dynamic - 1;
+        heap.release(last, 1);
+        assert_eq!(heap.dynamic(2), None);
     }
 }
