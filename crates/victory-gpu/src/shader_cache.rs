@@ -61,6 +61,9 @@ fn build() -> &'static [u8; 32] {
                 // that a run with it translates.
                 bytes.push(u8::from(victory_shader::emit::wave_why()));
                 bytes.push(u8::from(victory_shader::emit::wave_split_lds()));
+                // `VICTORY_HEAP_USAGE`: shaders with and without the marks
+                // differ (ryotdev's fix to #1962, 6006a230).
+                bytes.push(u8::from(victory_shader::emit::heap_usage_marks()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -218,6 +221,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.heap_usage));
     out
 }
 
@@ -275,6 +279,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let heap_usage = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -284,6 +289,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        heap_usage,
     })
 }
 
@@ -311,6 +317,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            heap_usage: true,
         }
     }
 

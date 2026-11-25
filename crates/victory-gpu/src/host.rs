@@ -479,6 +479,9 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Host work done once the list has run, before the bottom-of-pipe
+    /// writes ([`HostList::defer_after`]).
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Host {
@@ -692,6 +695,11 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        for list in runs {
+            for work in &list.deferred().after {
+                work();
+            }
+        }
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1249,6 +1257,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Host work done each time the list has run (reading what it wrote),
+    /// before the title is told the GPU is done.
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -1652,6 +1666,18 @@ impl Meter {
                 crate::draw::take_table_drops(),
                 crate::draw::take_fresh_made(),
                 crate::draw::take_past_mirrored()
+            );
+            // Totals since the last of these lines, not per frame.
+            let [marked, made, no_heap, unregistered] = crate::descriptor::take_usage();
+            tracing::info!(
+                "heap usage: {marked} heap slots marked read by shaders, {made} placed-texture \
+                 views made for them ({} so far, never released); not made: {:?} (past the heap \
+                 or a sampler heap, already made, no view there, not a placed texture); \
+                 {no_heap} bitmaps with no view heap, {unregistered} marks on a heap not \
+                 registered or without a host heap; {} placed-texture views failed to make",
+                crate::descriptor::MADE_TOTAL.load(Ordering::Relaxed),
+                crate::descriptor::host::PLACED_WHY.each_ref().map(|a| a.swap(0, Ordering::Relaxed)),
+                crate::descriptor::host::PLACED_FAILED.swap(0, Ordering::Relaxed),
             );
             #[cfg(feature = "diagnostics")]
             {

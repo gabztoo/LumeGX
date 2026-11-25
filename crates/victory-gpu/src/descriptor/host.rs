@@ -551,6 +551,38 @@ impl HostHeap {
         }
     }
 
+    /// Makes the view of slot `index` (at `handle` in title memory) if it
+    /// is a placed texture's the host left null for later ([`Self::mirror`]),
+    /// as a draw reading it through a table would: the title texture it
+    /// views, if it made it.
+    pub(crate) fn make_placed(&self, index: u32, handle: u64) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if index >= self.count || self.sampler {
+            PLACED_WHY[0].fetch_add(1, Relaxed);
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == key {
+            PLACED_WHY[1].fetch_add(1, Relaxed);
+            return None;
+        }
+        let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
+            PLACED_WHY[2].fetch_add(1, Relaxed);
+            return None;
+        };
+        if !is_placed_texture(&view) {
+            PLACED_WHY[3].fetch_add(1, Relaxed);
+            return None;
+        }
+        self.mirror(index, handle, true);
+        match placed_texture(&view) {
+            Some(View::Shader(texture, _)) => Some(texture),
+            _ => None,
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there and, for
     /// draws, the copy of title buffer memory the slot views. Buffer views
@@ -601,6 +633,9 @@ impl HostHeap {
             };
             let kept = kept.unwrap_or_else(|| {
                 if !self.sampler {
+                    if !later && is_placed_texture(&view) {
+                        PLACED_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     null_for(&view, self.cpu(index));
                 }
                 Kept::Nothing
@@ -1316,6 +1351,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
         }
     }
+}
+
+/// Marked heap slots not made, by reason: past the heap or in a sampler
+/// heap, already made, no view of ours there, not a placed texture.
+pub(crate) static PLACED_WHY: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Placed-texture views the host tried to make and could not (left null
+/// although marked made).
+pub(crate) static PLACED_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `view` is a view of a texture the title placed in memory itself.
+fn is_placed_texture(view: &View) -> bool {
+    matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
