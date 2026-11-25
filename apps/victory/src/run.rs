@@ -131,8 +131,11 @@ pub fn run(
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
     // Debugging aid: `VICTORY_SHADER_DUMP=1` writes the title's shaders that
-    // do not translate to `untranslated` in the cache dir.
-    if std::env::var_os("VICTORY_SHADER_DUMP").is_some() {
+    // do not translate to `untranslated` in the cache dir, and
+    // `VICTORY_DUMP_SHADERS=<hash>,...` those shaders too.
+    if std::env::var_os("VICTORY_SHADER_DUMP").is_some()
+        || std::env::var_os("VICTORY_DUMP_SHADERS").is_some()
+    {
         match cfg.cache_subdir("untranslated") {
             Ok(dir) => victory_hle::modules::d3d12x::dump_untranslated_shaders_to(dir),
             Err(e) => eprintln!("no folder for untranslated shaders: {e}"),
