@@ -204,6 +204,61 @@ impl HostHeap {
     }
 }
 
+/// The first run of `n` free slots in cursor order: a run starting at
+/// `cursor` or after it, else one starting before it, which may cross the
+/// cursor but not wrap past the end. Upstream #974's search, kept apart from
+/// [`HostHeap::dynamic`] so every small pattern can be checked against an
+/// oracle.
+fn free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    // Search from `cursor` on, then from the start (extending past cursor by
+    // n - 1 so contiguous runs crossing the cursor are not missed).
+    let end = taken.len();
+    let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+    let starts = (cursor..end).chain(0..second_end);
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in starts {
+        // A run cannot wrap past the end.
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            return Some(at + 1 - n);
+        }
+    }
+    None
+}
+
+/// Free dynamic slots in all and the longest run of them (runs do not wrap
+/// past the end), for the report of a refused table.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
+}
+
+/// How to read a refused table of `n` slots from [`free_space`]: fewer free
+/// slots than `n` is the pool running out; enough free slots but no run of
+/// `n` is fragmentation; a free run of `n` refused is a fault of the search.
+fn refusal_kind(n: usize, free: usize, longest: usize) -> &'static str {
+    if longest >= n {
+        "search bug: a long enough free run was refused"
+    } else if free >= n {
+        "fragmentation: enough free slots, no run that long"
+    } else {
+        "exhaustion: fewer free slots than the table needs"
+    }
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -230,30 +285,20 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = free_run(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                // Still under the lock: the slots as the search saw them.
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    reading = refusal_kind(n, free, longest),
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -1109,6 +1154,55 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
+
+    /// Every pattern of 8 slots, every cursor and size, against an oracle:
+    /// the first start in cursor order whose `n` slots are all free.
+    #[test]
+    fn free_run_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_run(&taken, cursor, n),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The refusal measured on this tree before #974: a pool of 2^16 with
+    /// only slots 0..10 free and the cursor at 5 refused a table of 10.
+    #[test]
+    fn a_table_of_the_free_slots_around_the_cursor_is_found() {
+        let mut taken = vec![true; 1 << 16];
+        taken[..10].fill(false);
+        assert_eq!(free_run(&taken, 5, 10), Some(0));
+        assert_eq!(free_run(&taken, 5, 11), None);
+        assert_eq!(free_space(&taken), (10, 10));
+    }
+
+    #[test]
+    fn refusals_read_as_exhaustion_fragmentation_or_search_fault() {
+        assert!(refusal_kind(10, 9, 9).starts_with("exhaustion"));
+        assert!(refusal_kind(10, 30, 9).starts_with("fragmentation"));
+        assert!(refusal_kind(10, 30, 10).starts_with("search bug"));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
