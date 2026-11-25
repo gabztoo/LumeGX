@@ -64,6 +64,7 @@ fn build() -> &'static [u8; 32] {
                 // `VICTORY_HEAP_USAGE`: shaders with and without the marks
                 // differ (ryotdev's fix to #1962, 6006a230).
                 bytes.push(u8::from(victory_shader::emit::heap_usage_marks()));
+                bytes.push(u8::from(victory_shader::emit::view_strides()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

@@ -18,6 +18,10 @@ pub const MEMORY_SPACE: u32 = 2;
 /// Heap slots the heap-usage bitmap has a bit for (the title's view heaps
 /// hold up to 1,245,184).
 pub const HEAP_VIEWS: u32 = 1 << 21;
+/// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`]) of the host's
+/// view-stride table: dword `i` the byte stride of the buffer view at title
+/// heap slot `i` (0 for none).
+pub const VIEW_STRIDES: u8 = 255;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -104,6 +104,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// The program picks views from the resource heap itself (a root
+    /// parameter of type 5): the buffers the heap's views read are kept
+    /// current for it (`descriptor::host::HostHeap::heap_buffers`).
+    pub(crate) reads_heap: bool,
 }
 
 #[cfg(windows)]
@@ -148,7 +152,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let program = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -157,12 +161,16 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    let reads_heap = program.as_ref().is_some_and(|p| {
+        p.layout
+            .iter()
+            .any(|r| r.root == victory_shader::RootType::ResourceHeap)
+    });
+    let used = program.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, reads_heap })
 }
 
 /// Diagnostics: the console resources each stage of pipeline `this` uses

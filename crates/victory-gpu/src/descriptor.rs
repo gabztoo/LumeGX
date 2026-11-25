@@ -254,17 +254,26 @@ fn make_used(heap: usize, used: &[u32]) -> u64 {
     };
     let step = u64::from(step);
     let mut made = Vec::new();
+    let mut buffers = 0;
     for &index in used {
-        if let Some(texture) = host.make_placed(index, h.start + u64::from(index) * step) {
-            made.push(texture);
+        match host.make_marked(index, h.start + u64::from(index) * step) {
+            host::Marked::Texture(texture) => made.push(texture),
+            host::Marked::Buffer => buffers += 1,
+            host::Marked::Nothing => {}
         }
     }
     drop(heaps);
     MADE_TOTAL.fetch_add(made.len() as u64, Relaxed);
-    let n = made.len() as u64;
+    BUFFERS_MARKED.fetch_add(buffers, Relaxed);
+    let n = made.len() as u64 + buffers;
     MADE.lock().unwrap_or_else(|e| e.into_inner()).extend(made);
     n
 }
+
+/// Buffer views shaders read from the heap itself, entered to be kept
+/// current so far (`host::HostHeap::make_marked`).
+#[cfg(windows)]
+pub(crate) static BUFFERS_MARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
