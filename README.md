@@ -1,197 +1,46 @@
-# VIctory
+<div align="center">
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+# LumeGX
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+**Do primeiro pixel à cena iluminada.**
 
-## Status (2026-11-24)
+Fork experimental do [VIctory](https://github.com/Marvisak/VIctory) para investigar como GTA VI de Xbox Series X|S executa e renderiza no Windows.
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps,
-loads the world and shows it: slowly, and with rendering defects.
+[Marcos visuais](docs/progresso/2026-11-24/README.md) · [Primeiros passos](#primeiros-passos) · [Arquitetura](docs/architecture.md) · [Guia técnico](docs/guia-victory.md)
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | drawn and shown: streets, buildings, vehicles, characters, the title card and credits; 1-2 s per frame. Surfaces are unlit, a band of distant geometry is missing, characters come out broken in some shots |
+</div>
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+---
 
-> **Warning.** Entering the world on a real GPU has hung it in earlier
-> builds, and Windows then resets the display driver (every monitor goes
-> black for a moment). The latest runs did not, but it is not ruled out; a
-> run can also end on a GPU fault (`crashes.log`). A diagnostics build with
-> `VICTORY_D3D12_WARP=1` renders on the software adapter instead (too slow
-> to reach the world in minutes).
+## O que já apareceu na tela?
 
-What each part does today and what it still needs:
+**Créditos e legendas já aparecem. A geometria do mundo também foi vista, mas a cena iluminada ainda não.** Esses resultados vêm das builds locais de diagnóstico em uma Radeon RX 5700 XT, no perfil Series X. O jogo ainda não está em estado jogável.
 
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+| Etapa | O que vimos |
+| :--- | :--- |
+| **01 · Introdução** | Os créditos aparecem em rosa e a legenda em português permanece legível mesmo quando o fundo está preto. |
+| **02 · Mundo em 3D** | Ao exibir um alvo intermediário de 2560 × 1440, surgiram cercas, postes e fios. As cores falsas revelam a forma dos objetos, não sua iluminação final. |
+| **03 · Saída em 4K** | No quadro **4896**, a GPU já recebia geometria do mundo, mas só **0,15%** dos pixels da imagem apresentada tinham algum canal acima de 5/255. A imagem já chegava escura à janela. |
 
-## Getting started
+**A pergunta em aberto:** a cena já entra escura no TAA2U, o ampliador usado no perfil Series X, ou perde a cor depois? Para distinguir os dois casos, precisamos identificar a textura que contém a cena iluminada e compará-la com a saída 4K **no mesmo quadro**.
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+O [registro de 24 de novembro de 2026](docs/progresso/2026-11-24/README.md) reúne builds, medições e hashes das capturas. Ele distingue os resultados das branches experimentais do que pode ser reproduzido a partir da `main`.
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+## Primeiros passos
+
+Para colaborar, você pode compilar e executar os testes **sem os arquivos do jogo**. Use Windows x64, Git e Rust com a [toolchain fixada pelo projeto](rust-toolchain.toml).
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+git clone https://github.com/gabztoo/LumeGX.git
+cd LumeGX
+cargo xtask install-hooks
+cargo test --workspace
 ```
 
-Run the title:
+O nome do fork é **LumeGX**; o pacote Cargo e o executável continuam se chamando `victory` e `victory.exe`. Para executar o título com seus próprios arquivos, consulte os [requisitos, configuração e comandos de execução](docs/guia-victory.md#getting-started). Para investigar um quadro, veja as [opções de diagnóstico](docs/guia-victory.md#debugging).
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
+## Trabalhar no mesmo fork
 
-The `translate --cache` step (minutes; again after a change of the shader
-translator) translates every shader the title can ask for into the cache
-(about 1.3 GB), so a run does not translate them while it plays; without it
-they are translated at first use, and their draws wait. With `--pipelines`
-it then makes every pipeline in the title's shader pack (inside
-`shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
-compiles none of those either; the library belongs to the GPU and driver it
-was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made. On a 4-core/8-thread PC with 16 GiB RAM, start
-with `--jobs 2` to limit offline memory and CPU contention. With the game
-closed, use the same executable, configuration, GPU and driver as the run:
+Abra uma branch por mudança e envie o PR para **`gabztoo/LumeGX:main`**. Em um PR de renderização, informe a build, o perfil de console, a GPU, o quadro observado e o que mudou na imagem. Isso permite que outra pessoa compare o mesmo estágio sem confundir loading, geometria intermediária e apresentação final.
 
-```powershell
-$game = 'D:\GTA 6\GTA6.Xbox.v1.0.2.1'
-$env:VICTORY_CONFIG = 'D:\GTA 6\wt\victory-data\victory.toml'
-& .\target\diag\victory.exe translate --cache --pipelines --jobs 2 `
-    "$game\shaders.rpf" "$game\game_scarlett_master.exe" `
-    "$game\XboxBvhBuilder.dll" "$game\amd_fidelityfx_upscaler_xbox.dll"
-```
-
-Use `target\release` instead if that is the build you run. Check the
-summary for skipped pack entries: unsupported stages or GPU features,
-unnamed state, or different runtime descriptions still need handling.
-
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
-[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
-`Kits/FidelityFX/signedbin` folder, which holds
-`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-Runtime pipeline settings (all builds):
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_PIPELINE_WORKERS=<n>` | 1–16 runtime workers; default is half the logical processors, clamped to 2–8 |
-| `VICTORY_PIPELINE_PRIORITY=auto\|normal\|below-normal` | Auto boosts above 64 outstanding PSOs and lowers at 32 or fewer; the other values set fixed priorities |
-| `VICTORY_PIPELINE_WAIT_MS=<n>` | Shared wait budget per frame (0–5000 ms, default 500); use 24 for a shorter wait or 0 to queue without waiting |
-
-On a library miss, a runtime worker defers cold compiles when the relevant
-one-wide lane is busy: one for 256 KiB to under 4 MiB of host shader bytecode,
-one for 4 MiB and over. Cache hits, smaller compiles, and the offline
-pre-build do not need a lane. Draws can still be dropped while PSOs are pending.
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WAIT_VALUE=1` | opt in to experimental 32/64-bit command-list memory waits, which can stall world entry. Unset or `0` leaves these waits as no-ops; queue fence waits and memory writes are unchanged. Also works in release |
-| `VICTORY_NO_WATCHDOG=1` | opt-in diagnostic workaround for the title watchdog on build 1.0.2.1; may hide a real stall. Also works in release |
-| `VICTORY_SLEEP_HOLD=1` | build 1.0.2.1 only: give title watchdog ticks up to 500 ms of extra time for pending pipeline binds without disabling the watchdog. Also works in release |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_SHOW_TARGET=list` or `<w>x<h>-f<format>` | lists submitted target shapes, or scales the last matching submitted 2D target into each present; unsupported/missing targets fall back to the title image. `VICTORY_SHOW_EXPOSURE` adjusts HDR tonemapping. |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+[Arquitetura do runtime](docs/architecture.md) · [Política de arquivos e capturas](docs/asset-policy.md) · [Licença GPL-3.0-or-later](LICENSE)

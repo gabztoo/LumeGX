@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+pub(crate) mod compare;
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -421,6 +423,7 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
     if resource.is_null() {
         return;
     }
+    compare::note_target(resource);
     if show_enabled() {
         list.note_show_target(resource);
     }
@@ -994,29 +997,33 @@ pub(crate) fn probe(
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+/// Sampled color bytes, without alpha or readback padding.
+fn probe_colors(buffer: &ID3D12Resource) -> Option<[[u8; 3]; (GRID * GRID) as usize]> {
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+    // SAFETY: the copies finished (every submission is waited for). Read only
+    // the RGB bytes the GPU wrote, not the uninitialized placement padding.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
-        let bytes =
-            std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
-        let level = bytes
-            .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
-            .max()
-            .unwrap_or(0);
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let colors = std::array::from_fn(|i| {
+            std::array::from_fn(|channel| *data.cast::<u8>().add(i * SLOT as usize + channel))
+        });
         buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        level < 8
+        Some(colors)
     }
+}
+
+pub(crate) fn probe_level(buffer: &ID3D12Resource) -> Option<u8> {
+    probe_colors(buffer)?.into_iter().flatten().max()
+}
+
+/// Adds a successful source probe to the fade meter.
+pub(crate) fn record_level(level: u8) -> bool {
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    if levels.len() == 12 {
+        levels.pop_front();
+    }
+    levels.push_back(level);
+    level < 8
 }
 
 /// The brightest probed channel of the last frames, oldest first: a fade
