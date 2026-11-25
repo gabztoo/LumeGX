@@ -1669,8 +1669,9 @@ impl Meter {
             );
             let [lists, ranges] = crate::draw::take_heap_refreshes();
             tracing::info!(
-                "heap buffers: {lists} lists brought {ranges} ranges up to date for programs reading the heap itself; {} buffer views marked so far",
-                crate::descriptor::BUFFERS_MARKED.load(Ordering::Relaxed)
+                "heap buffers: {lists} lists brought {ranges} ranges up to date for programs reading the heap itself; {} buffer views marked so far; {} root UAVs off 16 bytes bound through a copy of their own",
+                crate::descriptor::BUFFERS_MARKED.load(Ordering::Relaxed),
+                crate::draw::take_misaligned_root_uavs()
             );
             // Totals since the last of these lines, not per frame.
             let [marked, made, no_heap, unregistered] = crate::descriptor::take_usage();
