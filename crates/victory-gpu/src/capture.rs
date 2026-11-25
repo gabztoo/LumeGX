@@ -242,8 +242,6 @@ pub(crate) fn save_read_back(
     }
 }
 
-pub(crate) mod blit;
-
 type TargetShape = (u64, u32, i32);
 type Target = std::sync::Arc<crate::resource::HostTexture>;
 

@@ -102,15 +102,36 @@ pub(crate) fn exposure() -> f32 {
     })
 }
 
+/// Source rectangle in normalized coordinates. A null rect denotes the full image.
+fn uv_rect(rect: Option<[u32; 4]>, w: u32, h: u32) -> Option<[f32; 4]> {
+    let [l,t,r,b] = rect.unwrap_or([0,0,w,h]);
+    if l >= r || t >= b || r > w || b > h { return None; }
+    Some([l as f32 / w as f32, t as f32 / h as f32, (r-l) as f32 / w as f32, (b-t) as f32 / h as f32])
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Blend { Over, Opaque, IgnoreAlpha }
+
+impl Blend {
+    pub(crate) fn configured() -> Self {
+        static MODE: OnceLock<Blend> = OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("VICTORY_PRESENT_PLANES_BLEND").as_deref() {
+            Ok("opaque") => Self::Opaque,
+            Ok("ignore-alpha") => Self::IgnoreAlpha,
+            _ => Self::Over,
+        })
+    }
+}
+
 const SHADER: &str = r#"
 #define RS "DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)," \
-           "RootConstants(num32BitConstants=3, b0, visibility=SHADER_VISIBILITY_PIXEL)," \
+           "RootConstants(num32BitConstants=8, b0, visibility=SHADER_VISIBILITY_PIXEL)," \
            "StaticSampler(s0, filter=FILTER_MIN_MAG_LINEAR_MIP_POINT," \
            "addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, visibility=SHADER_VISIBILITY_PIXEL)"
 
 Texture2DArray<ELEMENT> src : register(t0);
 SamplerState linear_clamp : register(s0);
-cbuffer Options : register(b0) { float exposure; float scale; uint flags; };
+cbuffer Options : register(b0) { float exposure; float scale; uint flags; uint mode; float4 rect; };
 
 struct Vertex { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 
@@ -124,19 +145,20 @@ Vertex vs_main(uint id : SV_VertexID) {
 
 [RootSignature(RS)]
 float4 ps_main(Vertex v) : SV_Target {
-    float3 rgb;
+    v.uv = rect.xy + v.uv * rect.zw;
+    float4 rgba;
 #if FILTERABLE
     if ((flags & 8) != 0) {
-        rgb = src.SampleLevel(linear_clamp, float3(v.uv, 0), 0).rgb;
+        rgba = src.SampleLevel(linear_clamp, float3(v.uv, 0), 0);
     } else
 #endif
     {
         uint w, h, slices;
         src.GetDimensions(w, h, slices);
         uint2 p = min((uint2)(v.uv * float2(w, h)), uint2(w - 1, h - 1));
-        rgb = (float3)src.Load(int4(p, 0, 0)).rgb;
+        rgba = (float4)src.Load(int4(p, 0, 0));
     }
-    rgb *= scale;
+    float3 rgb = rgba.rgb * scale;
     if ((flags & 4) != 0) rgb = rgb.rrr;
     if ((flags & 1) != 0) {
         // Reinhard. Clamp first so bright half-float infinities are white.
@@ -144,7 +166,7 @@ float4 ps_main(Vertex v) : SV_Target {
         rgb = rgb / (1.0 + rgb);
     }
     if ((flags & 2) != 0) rgb = pow(saturate(rgb), 1.0 / 2.2);
-    return float4(saturate(rgb), 1);
+    return float4(saturate(rgb), mode == 1 ? saturate(rgba.a) : 1);
 }
 "#;
 
@@ -193,19 +215,27 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(device: &ID3D12Device, format: DXGI_FORMAT, kind: Kind) -> Result<Self> {
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT, kind: Kind, blend: Blend) -> Result<Self> {
         let vs = compile(Kind::Float, s!("vs_main"), s!("vs_5_1"))?;
         let ps = compile(kind, s!("ps_main"), s!("ps_5_1"))?;
         let code = |blob: &ID3DBlob| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes(blob).as_ptr().cast(),
             BytecodeLength: bytes(blob).len(),
         };
+        // IgnoreAlpha is an additive diagnostic: both RGB surfaces remain
+        // visible irrespective of UI alpha. Opaque replaces the whole base.
+        let destination = match blend {
+            Blend::Opaque => D3D12_BLEND_ZERO,
+            Blend::Over => D3D12_BLEND_INV_SRC_ALPHA,
+            Blend::IgnoreAlpha => D3D12_BLEND_ONE,
+        };
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
             SrcBlend: D3D12_BLEND_ONE,
-            DestBlend: D3D12_BLEND_ZERO,
+            BlendEnable: (blend != Blend::Opaque).into(),
+            DestBlend: destination,
             BlendOp: D3D12_BLEND_OP_ADD,
             SrcBlendAlpha: D3D12_BLEND_ONE,
-            DestBlendAlpha: D3D12_BLEND_ZERO,
+            DestBlendAlpha: destination,
             BlendOpAlpha: D3D12_BLEND_OP_ADD,
             LogicOp: D3D12_LOGIC_OP_NOOP,
             RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
@@ -255,7 +285,7 @@ impl Pipeline {
             })?;
             let heap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
+                NumDescriptors: 4,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })?;
@@ -266,7 +296,7 @@ impl Pipeline {
 
 #[derive(Default)]
 pub(crate) struct Blit {
-    pipelines: HashMap<(i32, Kind), Option<Pipeline>>,
+    pipelines: HashMap<(i32, Kind, Blend), Option<Pipeline>>,
     support: HashMap<i32, D3D12_FORMAT_SUPPORT1>,
     refused: Option<i32>,
 }
@@ -274,19 +304,24 @@ pub(crate) struct Blit {
 impl Blit {
     /// Called when creating the presenter or changing swap-chain format,
     /// never when the selected target first appears during loading.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn prepare(
         &mut self,
         device: &ID3D12Device,
         source: DXGI_FORMAT,
         dest: DXGI_FORMAT,
     ) {
+        self.prepare_mode(device, source, dest, Blend::Opaque);
+    }
+
+    fn prepare_mode(&mut self, device: &ID3D12Device, source: DXGI_FORMAT, dest: DXGI_FORMAT, blend: Blend) {
         // Typeless formats in view() all map to float/normalized SRVs.
         let (kind, _) = shader_kind(source);
-        self.pipelines.entry((dest.0, kind)).or_insert_with(|| {
+        self.pipelines.entry((dest.0, kind, blend)).or_insert_with(|| {
             // SAFETY: a plain query for the calling thread's ID.
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             tracing::info!(source = source.0, destination = dest.0, ?kind, tid, "creating show target blit PSO");
-            match Pipeline::new(device, dest, kind) {
+            match Pipeline::new(device, dest, kind, blend) {
                 Ok(pipeline) => {
                     tracing::info!(source = source.0, destination = dest.0, tid, exposure = exposure(), "show target blit ready");
                     Some(pipeline)
@@ -303,6 +338,7 @@ impl Blit {
     /// it in COPY_SOURCE so it can be captured or probed. Restores the
     /// source state. On failure records nothing and leaves both untouched.
     /// The presenter serializes the heap's single SRV until execution ends.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn record(
         &mut self,
         host: &Host,
@@ -311,6 +347,14 @@ impl Blit {
         back: &ID3D12Resource,
         exposure: f32,
     ) -> bool {
+        self.layer(host, list, shown, back, exposure, 0, None, Blend::Opaque, false)
+    }
+
+    /// Leaves back in COPY_SOURCE after each successful layer. Each draw
+    /// gets its own descriptor slot until the present fence completes.
+    pub(crate) fn layer(&mut self, host: &Host, list: &ID3D12GraphicsCommandList,
+        shown: &HostTexture, back: &ID3D12Resource, exposure: f32, index: usize,
+        rect: Option<[u32;4]>, blend: Blend, compose: bool) -> bool {
         let texture = &shown.texture;
         // SAFETY: live source and destination, owned by the caller.
         let (d, b) = unsafe { (texture.GetDesc(), back.GetDesc()) };
@@ -353,13 +397,18 @@ impl Blit {
             }
             return false;
         };
-        let Some(Some(p)) = self.pipelines.get(&(b.Format.0, v.kind)) else {
+        let Some(uv) = uv_rect(rect, d.Width as u32, d.Height) else { return false; };
+        if index >= 4 { return false; }
+        let blend = if index == 0 { Blend::Opaque } else { blend };
+        if compose { self.prepare_mode(device, v.format, b.Format, blend); }
+        let Some(Some(p)) = self.pipelines.get(&(b.Format.0, v.kind, blend)) else {
             return false;
         };
         let state = D3D12_RESOURCE_STATES(legal_for(d.Flags.0 as u32, shown.state.load(Relaxed)) as i32);
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        let constants = [exposure.to_bits(), v.scale.to_bits(), v.flags];
+        let constants = [exposure.to_bits(), v.scale.to_bits(), v.flags, u32::from(blend == Blend::Over),
+            uv[0].to_bits(), uv[1].to_bits(), uv[2].to_bits(), uv[3].to_bits()];
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: v.format,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
@@ -375,20 +424,21 @@ impl Blit {
         // SAFETY: an open presenter list and live resources. Its previous use
         // of the heap finished before the presenter could record another.
         unsafe {
-            device.CreateShaderResourceView(
-                texture,
-                Some(&srv),
-                p.heap.GetCPUDescriptorHandleForHeapStart(),
-            );
+            let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let mut cpu = p.heap.GetCPUDescriptorHandleForHeapStart();
+            let mut gpu = p.heap.GetGPUDescriptorHandleForHeapStart();
+            cpu.ptr += index * step;
+            gpu.ptr += (index * step) as u64;
+            device.CreateShaderResourceView(texture, Some(&srv), cpu);
             let rtv = host.rtv(back, None);
             if state != read {
                 list.ResourceBarrier(&[transition(texture, state, read)]);
             }
-            list.ResourceBarrier(&[transition(back, D3D12_RESOURCE_STATE_PRESENT, render)]);
+            list.ResourceBarrier(&[transition(back, if index == 0 { D3D12_RESOURCE_STATE_PRESENT } else { D3D12_RESOURCE_STATE_COPY_SOURCE }, render)]);
             list.SetPipelineState(&p.pso);
             list.SetGraphicsRootSignature(&p.root);
             list.SetDescriptorHeaps(&[Some(p.heap.clone())]);
-            list.SetGraphicsRootDescriptorTable(0, p.heap.GetGPUDescriptorHandleForHeapStart());
+            list.SetGraphicsRootDescriptorTable(0, gpu);
             list.SetGraphicsRoot32BitConstants(
                 1,
                 constants.len() as u32,
@@ -461,6 +511,15 @@ mod tests {
     }
 
     #[test]
+    fn plane_source_rect_is_bounded_and_normalized() {
+        assert_eq!(uv_rect(Some([1,2,3,6]), 4,8), Some([0.25,0.25,0.5,0.5]));
+        assert_eq!(uv_rect(None,1920,1080), Some([0.,0.,1.,1.]));
+        assert!(uv_rect(Some([0,5,2,4]),4,8).is_none());
+        assert!(uv_rect(Some([0,0,5,8]),4,8).is_none());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
     fn hdr_blit_fills_destination_with_tonemapped_color() {
         let Some(host) = crate::host::host() else {
             return;
@@ -500,6 +559,40 @@ mod tests {
             target.unwrap()
         };
         let render = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // Synthetic two-layer PresentX, including GPU readback. Base blue
+        // plus premultiplied half-red must produce half-red, half-blue.
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        for (mode, expected) in [(Blend::Over, [128,0,127]), (Blend::Opaque, [128,0,0]),
+            (Blend::IgnoreAlpha, [128,0,255])] {
+            let base = HostTexture::new(make_target(rgba, 2, render), render.0 as u32, Vec::new());
+            let ui = HostTexture::new(make_target(rgba, 4, render), render.0 as u32, Vec::new());
+            let back = make_target(rgba, 2, D3D12_RESOURCE_STATE_PRESENT);
+            let list = host.new_list().unwrap();
+            let mut blit = Blit::default();
+            // SAFETY: both inputs are live render targets. The right half of UI
+            // has a different color to check scaling from a cropped source.
+            unsafe {
+                list.list.ClearRenderTargetView(host.rtv(&base.texture,None), &[0.,0.,1.,1.], None);
+                list.list.ClearRenderTargetView(host.rtv(&ui.texture,None), &[0.,1.,0.,1.], None);
+                list.list.ClearRenderTargetView(host.rtv(&ui.texture,None), &[0.5,0.,0.,0.5],
+                    Some(&[RECT {left:2,top:0,right:4,bottom:4}]));
+            }
+            assert!(blit.layer(host,&list.list,&base,&back,1.,0,None,mode,true));
+            assert!(blit.layer(host,&list.list,&ui,&back,1.,1,Some([2,0,4,4]),mode,true));
+            let (buf, fp) = crate::capture::read_back(device,&list.list,&back).unwrap();
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: completed fence, mapped readback of 2x2 RGBA8 pixels.
+            unsafe {
+                let mut data = std::ptr::null_mut();
+                buf.Map(0,None,Some(&mut data)).unwrap();
+                for y in 0..2 { for x in 0..2 {
+                    let px = std::slice::from_raw_parts(data.cast::<u8>().add(y * fp.Footprint.RowPitch as usize + x*4), 3);
+                    assert!(px.iter().zip(expected).all(|(&v,e)| v.abs_diff(e)<=1), "{mode:?}: {px:?}");
+                }}
+                buf.Unmap(0,None);
+            }
+        }
         for format in [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT] {
             let source = HostTexture::new(make_target(format, 2, render), render.0 as u32, Vec::new());
             let back = make_target(DXGI_FORMAT_R8G8B8A8_UNORM, 9, D3D12_RESOURCE_STATE_PRESENT);
@@ -516,7 +609,7 @@ mod tests {
                 );
             }
             assert!(blit.record(host, &list.list, &source, &back, 2.0));
-            let (buffer, footprint) = super::super::read_back(device, &list.list, &back).unwrap();
+            let (buffer, footprint) = crate::capture::read_back(device, &list.list, &back).unwrap();
             list.close();
             host.execute(&[&list]);
             assert!(host.log_messages().is_none());

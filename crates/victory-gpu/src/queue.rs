@@ -165,12 +165,23 @@ fn host_run(host: &'static crate::host::Host, lists: Vec<Arc<crate::host::HostLi
     }))
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// PresentX display plane (64-bit ABI). Only source_rect has established
+/// semantics after resources; never chase the other pointer or tail words.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rect: *const [u32; 4],
+    _common: *const u8,
+    _reserved: [u64; 4],
+}
+const _: () = assert!(size_of::<Plane>() == 0x48);
+
+#[cfg(windows)]
+fn compose_planes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_PLANES").is_some_and(|v| v == "1"))
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -275,9 +286,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// PresentX's plane *prefix* is known, not the array stride. Inspect only
-/// plane zero until we know the complete ABI; never treat the next 24 bytes
-/// as plane one. A token or back-buffer rotation alone is not a new shape.
+/// Lightweight first-plane trace. Buffer rotation alone is not a new shape.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn trace_present(planes: u32, first: *const Plane, parameters: *const u8) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -336,11 +345,23 @@ extern "system" fn present(
     };
     #[cfg(not(windows))]
     let resource = { let _ = (planes, plane_parameters); None };
-    queue(this).timeline.submit(Op::Run(Box::new(move || show(resource))));
+    // Snapshot the rectangles and retain resources before returning to the
+    // caller. The only display ABI confirmed so far is one resource per plane.
+    #[cfg(windows)]
+    let layers = if compose_planes() && (1..=4).contains(&planes) && !plane_parameters.is_null() {
+        // SAFETY: caller supplies planes records at the measured stride.
+        unsafe { std::slice::from_raw_parts(plane_parameters, planes as usize) }.iter().map(|p| {
+            if p.count != 1 || p.resources.is_null() { return None; }
+            // SAFETY: the one resource and optional source rect are caller-owned until return.
+            let (r, rect) = unsafe { (*p.resources, p.source_rect.as_ref().copied()) };
+            (!r.is_null()).then(|| (object::Held::new(r), rect))
+        }).collect::<Option<Vec<_>>>()
+    } else { None };
+    queue(this).timeline.submit(Op::Run(Box::new(move || show(resource, #[cfg(windows)] layers))));
     S_OK
 }
 
-fn show(resource: Option<object::Held>) {
+fn show(resource: Option<object::Held>, #[cfg(windows)] layers: Option<Vec<(object::Held, Option<[u32;4]>)>>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -384,9 +405,13 @@ fn show(resource: Option<object::Held>) {
         && let Some(texture) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
+        let layers = layers.as_ref().and_then(|items| items.iter().map(|(r, rect)| {
+            Some((crate::resource::host_copy(r.get())?, *rect))
+        }).collect::<Option<Vec<_>>>());
         let shown = host.present(
             &texture,
             frame,
+            layers.as_deref(),
             #[cfg(feature = "diagnostics")]
             shown_target.as_deref(),
         );
@@ -575,10 +600,21 @@ mod tests {
     #[test]
     fn present_trace_requires_only_the_first_prefix() {
         let resources = [std::ptr::null(); 2];
-        let first = Plane { token: 123, count: 2, resources: resources.as_ptr() };
+        let first = Plane { token: 123, count: 2, resources: resources.as_ptr(),
+            source_rect: std::ptr::null(), _common: std::ptr::null(), _reserved: [0;4] };
         // Deliberately supply just the known prefix even for a two-plane report.
         trace_present(2, &first, std::ptr::null());
         trace_present(0, std::ptr::null(), std::ptr::null());
+    }
+
+    #[test]
+    fn display_plane_abi() {
+        assert_eq!(size_of::<Plane>(), 0x48);
+        assert_eq!(std::mem::offset_of!(Plane, token), 0);
+        assert_eq!(std::mem::offset_of!(Plane, count), 8);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 0x10);
+        assert_eq!(std::mem::offset_of!(Plane, source_rect), 0x18);
+        assert_eq!(std::mem::offset_of!(Plane, _common), 0x20);
     }
 
     /// Where a queue's signal is: newer layouts have it two slots later.

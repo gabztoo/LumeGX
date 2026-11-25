@@ -2299,8 +2299,7 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
-    #[cfg(feature = "diagnostics")]
-    blit: crate::capture::blit::Blit,
+    blit: crate::blit::Blit,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -2439,6 +2438,7 @@ impl Host {
         &self,
         title: &crate::resource::HostTexture,
         frame: u64,
+        layers: Option<&[(std::sync::Arc<crate::resource::HostTexture>, Option<[u32; 4]>)]>,
         #[cfg(feature = "diagnostics")] shown_target: Option<&crate::resource::HostTexture>,
     ) -> Option<(u32, bool)> {
         let texture = &title.texture;
@@ -2496,10 +2496,26 @@ impl Host {
             let list = &p.copy.list;
             #[cfg(feature = "diagnostics")]
             let shown = shown_target.is_some_and(|target| {
-                p.blit.record(self, list, target, &back, crate::capture::blit::exposure())
+                p.blit.record(self, list, target, &back, crate::blit::exposure())
             });
             #[cfg(not(feature = "diagnostics"))]
             let shown = false;
+            let mut shown = shown;
+            if !shown && let Some(layers) = layers {
+                let blend = crate::blit::Blend::configured();
+                for (index, (layer, rect)) in layers.iter().enumerate() {
+                    if !p.blit.layer(self, list, layer, &back, 1., index, *rect, blend, true) {
+                        static WARN: std::sync::Once = std::sync::Once::new();
+                        WARN.call_once(|| tracing::warn!(index, ?rect, "cannot composite display plane"));
+                        break;
+                    }
+                    shown = true;
+                }
+                if shown {
+                    static LOG: std::sync::Once = std::sync::Once::new();
+                    LOG.call_once(|| tracing::info!(planes = layers.len(), ?blend, "PresentX display plane composition active"));
+                }
+            }
             let (read, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
             let (image, back_state) = if shown {
                 (&back, read)
@@ -2593,9 +2609,10 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
-            #[cfg(feature = "diagnostics")]
             let blit = {
-                let mut blit = crate::capture::blit::Blit::default();
+                #[allow(unused_mut)]
+                let mut blit = crate::blit::Blit::default();
+                #[cfg(feature = "diagnostics")]
                 if let Some(source) = crate::capture::requested_target_format() {
                     blit.prepare(&self.device, source, format);
                 }
@@ -2603,7 +2620,6 @@ impl Host {
             };
             Ok(Presenter {
                 swap_chain,
-                #[cfg(feature = "diagnostics")]
                 blit,
                 width,
                 height,
