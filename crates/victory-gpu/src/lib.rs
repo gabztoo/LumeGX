@@ -49,6 +49,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod stats;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

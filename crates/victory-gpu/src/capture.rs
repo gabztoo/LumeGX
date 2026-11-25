@@ -19,16 +19,21 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level. `w+K` names the K-th frame
+/// after the first with over 400 draws (the world's, whose number varies
+/// from run to run with loading; `crate::queue::world`).
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    static LIST: std::sync::OnceLock<(Vec<u64>, Vec<u64>)> = std::sync::OnceLock::new();
+    let (frames, after_world) = LIST.get_or_init(|| {
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+        let entries: Vec<&str> = list.split(',').map(str::trim).collect();
+        (
+            entries.iter().filter_map(|f| f.parse().ok()).collect(),
+            entries.iter().filter_map(|f| f.strip_prefix("w+")?.parse().ok()).collect(),
+        )
+    });
+    let world = crate::queue::world();
+    frames.contains(&n) || world != 0 && n > world && after_world.contains(&(n - world))
 }
 
 /// Whether frame `n` is saved.

@@ -232,6 +232,15 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The first frame presented with over 400 draws (the world's; 0 before).
+static WORLD: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics: see [`WORLD`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn world() -> u64 {
+    WORLD.load(Ordering::Relaxed)
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -243,6 +252,10 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if crate::list::take_frame_draws() > 400 && WORLD.load(Ordering::Relaxed) == 0 {
+        WORLD.store(frame, Ordering::Relaxed);
+        tracing::info!(frame, "first frame with over 400 draws (the world's)");
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::producers::presented(frame);
     if frame.is_power_of_two() {

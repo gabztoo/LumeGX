@@ -111,6 +111,9 @@ pub(crate) struct State {
     /// [`State::drop_for`].
     #[cfg(feature = "diagnostics")]
     dropped_why: &'static str,
+    /// This list's pipeline-statistics queries (`VICTORY_PIPELINE_STATS=1`).
+    #[cfg(feature = "diagnostics")]
+    stats: Option<crate::stats::ListStats>,
 }
 
 impl Drop for State {
@@ -879,8 +882,12 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let slot = self.stats_begin(list);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    self.stats_end(list, slot, None);
                     self.drawn_one();
                     true
                 }
@@ -1452,6 +1459,31 @@ impl State {
         }
     }
 
+    /// Diagnostics (`VICTORY_PIPELINE_STATS=1`): begins the statistics query
+    /// of the draw about to be recorded; its slot.
+    #[cfg(feature = "diagnostics")]
+    fn stats_begin(&mut self, list: &HostList) -> Option<u32> {
+        if !crate::stats::on() {
+            return None;
+        }
+        if self.stats.is_none() {
+            self.stats = crate::stats::ListStats::new(list);
+        }
+        self.stats.as_ref()?.begin(list)
+    }
+
+    /// Ends the query [`Self::stats_begin`] began, under the pipeline's
+    /// shaders and the count of targets (`+d`: a depth target).
+    #[cfg(feature = "diagnostics")]
+    fn stats_end(&self, list: &HostList, slot: Option<u32>, args: Option<crate::stats::Args>) {
+        let (Some(slot), Some(stats)) = (slot, &self.stats) else {
+            return;
+        };
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(|| "?".to_owned(), |p| p.name.clone());
+        let depth = if self.depth != 0 { "+d" } else { "" };
+        stats.end(list, slot, format!("{name} targets {}{depth}", self.targets.len()), args);
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -1475,11 +1507,15 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let slot = self.stats_begin(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.stats_end(list, slot, None);
             self.drawn_one();
         }
         if !ran {
@@ -1573,11 +1609,15 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let slot = self.stats_begin(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.stats_end(list, slot, None);
             self.drawn_one();
         }
         if !ran {
@@ -1612,7 +1652,10 @@ impl State {
                 self.note_dropped_writes();
             }
             let (kind, _, max) = signature;
-            let what = || format!("indirect kind {kind} max {max}{}", if ran { "" } else { " DROPPED" });
+            let what = || {
+                let count = count.map_or(String::new(), |c| format!(" count at {c:#x}"));
+                format!("indirect kind {kind} max {max} at {arguments:#x}{count}{}", if ran { "" } else { " DROPPED" })
+            };
             self.trace(what, kind == 2);
         }
         ran
@@ -1717,6 +1760,8 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let slot = if kind == DISPATCH { None } else { self.stats_begin(list) };
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1729,6 +1774,16 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        self.stats_end(
+            list,
+            slot,
+            Some(crate::stats::Args {
+                kind,
+                record: (args.clone(), arguments),
+                count: counter.clone(),
+            }),
+        );
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1922,11 +1977,24 @@ const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::listed(crate::queue::presented() + 1) {
+        let v: Vec<_> = viewports
+            .iter()
+            .map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth))
+            .collect();
+        tracing::debug!("draw viewports {v:?}");
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::listed(crate::queue::presented() + 1) {
+        let r: Vec<_> = rects.iter().map(|r| (r.left, r.top, r.right, r.bottom)).collect();
+        tracing::debug!("draw scissors {r:?}");
+    }
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }
