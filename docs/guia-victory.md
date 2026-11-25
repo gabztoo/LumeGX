@@ -127,6 +127,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_DUMP_SHADERS=<hash>,...` | writes these shaders (16-digit hashes as the logs print them) to the same folder even when they translate, e.g. the ones a device-removed report names |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_DESCRIPTOR_POOL=legacy` | dynamic descriptor tables are searched and sized as before (no free run across the search cursor, a fresh table from entry 0), for A/B runs with one binary; the line `dynamic descriptor slots: ... tables refused`, every 5 s, counts the refusals since the previous one (fewer free slots than the table needs: exhaustion; enough but no run that long: fragmentation) and the draws dropped for them |
 | `VICTORY_DEPTH_BOUNDS=0` | the title's depth bounds test is left out (pipelines without it, the bounds lists set ignored), as before it was supported; the log line `depth bounds: ... draws/frame with the test` says how many draws use it |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |

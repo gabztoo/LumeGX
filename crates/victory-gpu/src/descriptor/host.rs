@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -30,9 +31,9 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset), and how many are free.
+    next: Mutex<(u32, Vec<bool>, usize)>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -145,7 +146,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; extra as usize], extra as usize)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -208,15 +209,20 @@ impl HostHeap {
 /// `cursor` or after it, else one starting before it, which may cross the
 /// cursor but not wrap past the end. Upstream #974's search, kept apart from
 /// [`HostHeap::dynamic`] so every small pattern can be checked against an
-/// oracle.
-fn free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+/// oracle. Without `cross`, runs crossing the cursor are missed, as before
+/// #974 (`VICTORY_DESCRIPTOR_POOL=legacy`).
+fn free_run(taken: &[bool], cursor: usize, n: usize, cross: bool) -> Option<usize> {
     if n == 0 {
         return None;
     }
     // Search from `cursor` on, then from the start (extending past cursor by
     // n - 1 so contiguous runs crossing the cursor are not missed).
     let end = taken.len();
-    let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+    let second_end = if cross {
+        cursor.saturating_add(n.saturating_sub(1)).min(end)
+    } else {
+        cursor.min(end)
+    };
     let starts = (cursor..end).chain(0..second_end);
     let mut run = 0;
     let mut last = usize::MAX;
@@ -232,6 +238,35 @@ fn free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Dynamic tables refused since the last [`take_refused`]: with fewer free
+/// slots than they need (exhaustion), and with enough free slots but no
+/// run that long (fragmentation).
+static REFUSED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`REFUSED`], counted again from 0.
+pub(crate) fn take_refused() -> [u64; 2] {
+    [0, 1].map(|i| REFUSED[i].swap(0, Ordering::Relaxed))
+}
+
+/// `VICTORY_DESCRIPTOR_POOL=legacy`: dynamic tables are searched and sized
+/// as before upstream #974 and #1349 (no run across the search cursor, a
+/// fresh table from entry 0), for A/B runs with one binary. It changes no
+/// translation, so the shader cache is shared by both arms.
+pub(crate) fn legacy_pool() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        let legacy =
+            std::env::var_os("VICTORY_DESCRIPTOR_POOL").is_some_and(|v| v == "legacy");
+        if legacy {
+            tracing::warn!(
+                "VICTORY_DESCRIPTOR_POOL=legacy: dynamic descriptor tables searched and sized \
+                 as before"
+            );
+        }
+        legacy
+    })
 }
 
 /// Free dynamic slots in all and the longest run of them (runs do not wrap
@@ -283,9 +318,10 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, free) = &mut *guard;
         let n = n as usize;
-        let Some(first) = free_run(taken, *next as usize, n) else {
+        let Some(first) = free_run(taken, *next as usize, n, !legacy_pool()) else {
+            REFUSED[usize::from(*free >= n)].fetch_add(1, Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 // Still under the lock: the slots as the search saw them.
@@ -302,6 +338,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        *free -= n;
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -321,8 +358,10 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, taken, free) = &mut *guard;
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        if let Some(slots) = taken.get_mut(at as usize..end) {
+            *free += slots.iter().filter(|&&held| held).count();
             slots.fill(false);
         }
     }
@@ -1177,7 +1216,7 @@ mod tests {
                             .is_some_and(|table| table.iter().all(|&held| !held))
                     });
                     assert_eq!(
-                        free_run(&taken, cursor, n),
+                        free_run(&taken, cursor, n, true),
                         expected,
                         "{mask:#x} {cursor} {n}"
                     );
@@ -1192,9 +1231,33 @@ mod tests {
     fn a_table_of_the_free_slots_around_the_cursor_is_found() {
         let mut taken = vec![true; 1 << 16];
         taken[..10].fill(false);
-        assert_eq!(free_run(&taken, 5, 10), Some(0));
-        assert_eq!(free_run(&taken, 5, 11), None);
+        assert_eq!(free_run(&taken, 5, 10, true), Some(0));
+        assert_eq!(free_run(&taken, 5, 11, true), None);
         assert_eq!(free_space(&taken), (10, 10));
+        // The legacy arm of an A/B refuses it, as this tree did.
+        assert_eq!(free_run(&taken, 5, 10, false), None);
+    }
+
+    /// The free count a refusal is classified by follows takes and releases,
+    /// a release of slots not taken included.
+    #[test]
+    fn the_free_count_follows_takes_and_releases() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let counted = |heap: &HostHeap| {
+            let guard = heap.next.lock().unwrap();
+            (guard.2, guard.1.iter().filter(|&&held| !held).count())
+        };
+        let all = heap.dynamic as usize;
+        let a = heap.dynamic(7).unwrap();
+        let b = heap.dynamic(3).unwrap();
+        heap.release(a, 7);
+        heap.release(a, 7);
+        assert_eq!(counted(&heap), (all - 3, all - 3));
+        heap.release(b, 3);
+        assert_eq!(counted(&heap), (all, all));
     }
 
     #[test]

@@ -1634,6 +1634,15 @@ impl Meter {
             tracing::info!(
                 "depth bounds: {bounded:.1} draws/frame with the test, {bounds_set:.1} bounds set/frame"
             );
+            // Totals since the last of these lines, not per frame.
+            let [exhausted, fragmented] = crate::descriptor::host::take_refused();
+            tracing::info!(
+                "dynamic descriptor slots: {} tables refused ({exhausted} with fewer free slots \
+                 than they need, {fragmented} with enough but no run that long), {} draws or \
+                 dispatches dropped for them",
+                exhausted + fragmented,
+                crate::draw::take_table_drops()
+            );
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

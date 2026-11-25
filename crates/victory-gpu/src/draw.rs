@@ -120,6 +120,13 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Draws, mesh dispatches and dispatches dropped because a dynamic table of
+/// theirs was refused, since the last call.
+pub(crate) fn take_table_drops() -> u64 {
+    TABLE_DROPS.swap(0, Ordering::Relaxed)
+}
+static TABLE_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
@@ -476,6 +483,7 @@ impl State {
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+                TABLE_DROPS.fetch_add(1, Ordering::Relaxed);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -795,6 +803,8 @@ impl State {
                 continue;
             };
             let (start, end) = fresh_table_range(&entries, host.count());
+            // From entry 0, as before #1349, in the legacy arm of an A/B.
+            let start = if crate::descriptor::host::legacy_pool() { 0 } else { start };
             let n = end - start;
             // The table slice and what its entries hold (record words).
             let key = {
