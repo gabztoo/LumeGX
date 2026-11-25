@@ -79,6 +79,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// The pipeline of the last draw prepared runs the depth bounds test.
+    depth_bounds: bool,
 }
 
 impl Drop for State {
@@ -95,6 +97,15 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Draws run with a pipeline that tests depth bounds, and depth bounds the
+/// host lists were given, since the last [`take_depth_bounds`].
+static DEPTH_BOUNDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`DEPTH_BOUNDS`], counted again from 0.
+pub(crate) fn take_depth_bounds() -> [u64; 2] {
+    [0, 1].map(|i| DEPTH_BOUNDS[i].swap(0, Ordering::Relaxed))
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -356,6 +367,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        self.depth_bounds = p.depth_bounds;
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -642,7 +654,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    self.drawn_one();
                     true
                 }
                 Err(_) => false,
@@ -935,6 +947,14 @@ impl State {
         out
     }
 
+    /// Counts a draw run on the host (and one that tests depth bounds).
+    fn drawn_one(&self) {
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        if self.depth_bounds {
+            DEPTH_BOUNDS[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -961,7 +981,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn_one();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1048,7 +1068,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn_one();
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1176,7 +1196,7 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            self.drawn_one();
         }
         true
     }
@@ -1351,4 +1371,16 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// The depth bounds the title set, where the host runs the test
+/// (`Host::depth_bounds`); the pipelines that test them are made so.
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a device that supports depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+        DEPTH_BOUNDS[1].fetch_add(1, Ordering::Relaxed);
+    }
 }

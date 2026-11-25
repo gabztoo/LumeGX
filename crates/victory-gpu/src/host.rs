@@ -517,6 +517,32 @@ impl Host {
         })
     }
 
+    /// Whether the host runs the title's depth bounds test: the GPU
+    /// supports it (`D3D12_OPTIONS2`) and `VICTORY_DEPTH_BOUNDS=0` does
+    /// not turn it off. Without it a pipeline with the test is made
+    /// without it (its draws pass at every depth) and the bounds a list
+    /// sets are left out. Logged once.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            let on = std::env::var_os("VICTORY_DEPTH_BOUNDS").is_none_or(|v| v != "0");
+            tracing::info!(supported, on, "host depth bounds test");
+            supported && on
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -1590,6 +1616,8 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Draws whose pipeline tests depth bounds, and bounds given to lists.
+        let [bounded, bounds_set] = crate::draw::take_depth_bounds().map(|n| n as f64 / frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -1602,6 +1630,9 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
+            );
+            tracing::info!(
+                "depth bounds: {bounded:.1} draws/frame with the test, {bounds_set:.1} bounds set/frame"
             );
             #[cfg(feature = "diagnostics")]
             {
