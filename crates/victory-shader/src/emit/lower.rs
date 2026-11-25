@@ -197,6 +197,12 @@ struct Lower<'a> {
     halves: Option<u32>,
     /// The first console thread of this host wave, made in the entry block.
     wave_base: Option<V>,
+    /// With [`Self::halves`] and LDS in a group over 32 threads
+    /// (`VICTORY_WAVE_SPLIT_LDS=1`): per IR block whether every lane runs
+    /// it, and whether the two host waves of a console wave meet at its
+    /// start and before its exit ([`lds_meetings`]). LDS accesses in blocks
+    /// every lane runs get a group barrier each.
+    lds_meet: Option<LdsMeet>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -340,6 +346,206 @@ fn crosses_halves(st: &Structured, i: &Inst) -> Option<&'static str> {
     })
 }
 
+/// Per IR block: whether every lane runs it, and whether the host waves
+/// meet at its start and before its exit ([`lds_meetings`]).
+type LdsMeet = (Vec<bool>, Vec<(bool, bool)>);
+
+/// An LDS access the two host waves of a console wave must order (not a
+/// swizzle or permute, which only move values between lanes).
+fn lds_access(i: &Inst) -> bool {
+    let n = i.name();
+    matches!(i.fields, Fields::Ds { .. }) && !(n.starts_with("ds_swizzle") || n.contains("permute"))
+}
+
+/// Per IR block: every lane of the wave that started the program runs it,
+/// no per-lane branch separating it from the entry (it lies in no lane
+/// branch's region, [`lane_regions`]). None with an indirect exit.
+fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+    let mut all = vec![true; st.exits.len()];
+    for region in lane_regions(st)? {
+        for (a, inside) in all.iter_mut().zip(region) {
+            *a &= !inside;
+        }
+    }
+    Some(all)
+}
+
+/// Every per-lane branch's region: the blocks reachable from it that do
+/// not post-dominate it, which only some lanes run. Not branches on
+/// uniform conditions. None with an indirect exit.
+fn lane_regions(st: &Structured) -> Option<Vec<Vec<bool>>> {
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => succ[b].extend([taken, not_taken]),
+            LaneExit::End => {}
+            LaneExit::Indirect => return None,
+        }
+    }
+    // Post-dominators as bit sets (a virtual exit after every End).
+    let words = n.div_ceil(64);
+    let bit = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 == 1;
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                vec![u64::MAX; words]
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = vec![u64::MAX; words];
+            for &t in &succ[b] {
+                for (w, p) in v.iter_mut().zip(&pdom[t]) {
+                    *w &= p;
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                changed = true;
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    for (d, e) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { when, .. } = *e else {
+            continue;
+        };
+        if st
+            .bools
+            .support(when)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_)))
+        {
+            continue;
+        }
+        let mut seen = vec![false; n];
+        let mut stack = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if seen[b] || bit(&pdom[d], b) {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        regions.push(seen);
+    }
+    Some(regions)
+}
+
+/// LDS accesses of a console wave run as two host waves, where some sit in
+/// blocks that only some lanes run (`all` is [`all_lane_blocks`]): per IR
+/// block, whether the host waves meet (a group barrier) at its start and
+/// before its exit. None if barriers cannot keep the console's order.
+///
+/// The console runs the wave's lanes in step, so an LDS write is seen by
+/// every later read. Two host waves keep that order if they meet between
+/// any two accesses of which one writes. A barrier must be run by every
+/// thread, so it cannot stand in a lane branch's region; but every way
+/// into and out of such a region passes a block all lanes run, and the
+/// waves meet there: before the exit of an all-lane block into a region
+/// with LDS accesses, and at the start of an all-lane block entered from
+/// one. Accesses in all-lane blocks get their own barrier. A write and a
+/// read inside one region cannot be ordered: refused.
+/// shortcut: two writes in one region are taken not to hit the same dword
+/// from both halves.
+fn lds_meetings(p: &Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // Regions: blocks not every lane runs, joined by the edges between them.
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    let mut region: Vec<usize> = (0..n).collect();
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    let (mut reads, mut writes) = (vec![false; n], vec![false; n]);
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for i in block.insts.iter().filter(|i| lds_access(i)) {
+            if i.name().starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+            }
+        }
+    }
+    if (0..n).any(|r| reads[r] && writes[r]) {
+        return None;
+    }
+    let mut meet = vec![(false, false); n];
+    for b in 0..n {
+        for t in succ(b) {
+            if all[b] && !all[t] {
+                let r = find(&mut region, t);
+                meet[b].1 |= reads[r] || writes[r];
+            } else if !all[b] && all[t] {
+                let r = find(&mut region, b);
+                meet[t].0 |= reads[r] || writes[r];
+            }
+        }
+    }
+    Some(meet)
+}
+
+/// `VICTORY_WAVE_SPLIT_LDS=1`: a console wave64 program with LDS in a
+/// group over 32 threads, whose cross-lane code stays inside halves, runs
+/// in host waves of 32 that meet (a group barrier) around its LDS accesses
+/// ([`lds_meetings`]). Off by default: a barrier the two halves of a
+/// console wave do not both reach hangs the group, and a branch on a
+/// scalar the console computes for the whole wave (`v_readfirstlane`, say)
+/// can go two ways in two host waves. Part of the translation: the shader
+/// cache keys on it.
+pub fn wave_split_lds() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SPLIT_LDS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_SPLIT_LDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_split_lds`], for its thread only.
+    pub(super) static TEST_SPLIT_LDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The widest wave the host GPU runs (0: not known, no host-specific
 /// forms); see [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -454,6 +660,7 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut halves = None;
+        let mut lds_meet = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -486,8 +693,15 @@ impl<'a> Lower<'a> {
                 let crosses = insts().any(|i| crosses_halves(x.st, i).is_some())
                     || lane_constant_masks(x.st);
                 let lds_over_32 = s.lds_dwords > 0 && group > 32;
-                if !crosses && !lds_over_32 {
+                // LDS in a group over 32: the blocks every lane runs and
+                // where the host waves meet, when barriers can order it
+                let split = lds_over_32
+                    .then(|| all_lane_blocks(x.st))
+                    .flatten()
+                    .and_then(|all| lds_meetings(p, x.st, &all).map(|meet| (all, meet)));
+                if !crosses && (!lds_over_32 || split.is_some() && wave_split_lds()) {
                     wave = 32;
+                    lds_meet = split;
                 } else if wave_why() {
                     let mut why: Vec<&str> = Vec::new();
                     for r in insts().filter_map(|i| crosses_halves(x.st, i)) {
@@ -500,6 +714,11 @@ impl<'a> Lower<'a> {
                     }
                     if lds_over_32 {
                         why.push("LDS in a group over 32");
+                        why.push(match (&split, all_lane_blocks(x.st)) {
+                            (Some(_), _) => "split possible (VICTORY_WAVE_SPLIT_LDS=1)",
+                            (None, None) => "an indirect exit",
+                            (None, Some(_)) => "an LDS read and write in one lane-branch region",
+                        });
                     }
                     why.sort_unstable();
                     eprintln!(
@@ -602,6 +821,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             wave_base: None,
+            lds_meet,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -996,6 +1216,9 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
+                self.group_meeting();
+            }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
@@ -1009,6 +1232,9 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
+                self.group_meeting();
+            }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -2052,6 +2278,16 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// The host waves of the group meet in the current block: a group
+    /// barrier with a shared-memory fence, so LDS writes before it are seen
+    /// by reads after it.
+    fn group_meeting(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     /// A console wave64 program in host waves of 32 ([`Self::halves`]):
     /// the first console thread of this host wave (0, 32, 64, ...). A GPU
     /// need not give a host wave consecutive thread indices, so each wave
@@ -2482,6 +2718,12 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if lds_access(inst) && self.lds_meet.as_ref().is_some_and(|(all, _)| all[b]) {
+            // The two host waves of a console wave meet before each LDS
+            // access: what the other half wrote is visible, and what it
+            // still reads is not overwritten.
+            self.group_meeting();
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
