@@ -181,7 +181,17 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let adapter = high_performance_adapter();
+            if let Some(a) = &adapter {
+                let (name, vendor) = adapter_name(a);
+                tracing::info!(
+                    adapter = %name,
+                    vendor = format_args!("{vendor:#x}"),
+                    "host device on the high-performance adapter"
+                );
+            }
+            let unknown: Option<windows::core::IUnknown> = adapter.as_ref().and_then(|a| a.cast().ok());
+            D3D12CreateDevice(unknown.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // The widest wave the GPU runs: at 32 (NVIDIA) console wave64
@@ -243,6 +253,44 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// The hardware adapter DXGI ranks first for performance: on a laptop with
+/// an integrated and a discrete GPU, the discrete one. The default adapter
+/// (`D3D12CreateDevice` without one) is the first DXGI lists, which on such
+/// a laptop may be the integrated GPU, and which one comes first can change
+/// between boots. None if DXGI cannot rank adapters.
+fn high_performance_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: plain DXGI factory and adapter queries; the descriptions are
+    // ours.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..)
+            .map_while(|i| {
+                factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        i,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+            })
+            .find(|a| {
+                a.GetDesc1()
+                    .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+            })
+    }
+}
+
+/// An adapter's name and PCI vendor id, for the log.
+fn adapter_name(adapter: &IDXGIAdapter1) -> (String, u32) {
+    // SAFETY: a plain query into a description of ours.
+    match unsafe { adapter.GetDesc1() } {
+        Ok(d) => {
+            let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+            (String::from_utf16_lossy(&d.Description[..end]), d.VendorId)
+        }
+        Err(_) => (String::new(), 0),
     }
 }
 
