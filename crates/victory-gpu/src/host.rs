@@ -1648,6 +1648,10 @@ impl Meter {
             tracing::info!(
                 "depth bounds: {bounded:.1} draws/frame with the test, {bounds_set:.1} bounds set/frame"
             );
+            tracing::info!(
+                "textures read back into title buffers: {}",
+                crate::list::take_read_back()
+            );
             // Totals since the last of these lines, not per frame.
             let [bounded, zeros, no_slot, no_heap] = crate::draw::take_root_srvs();
             tracing::info!(
