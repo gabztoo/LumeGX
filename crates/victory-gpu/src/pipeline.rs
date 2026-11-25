@@ -296,9 +296,10 @@ pub(crate) fn is_skipped(this: This) -> bool {
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
+/// for want of a host pipeline (diagnostics); false if it has one (nothing
+/// counted).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+pub(crate) fn note_drop(this: This) -> bool {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -308,8 +309,10 @@ pub(crate) fn note_drop(this: This) {
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
-        note_why(why);
+        note_why(format!("no host pipeline: {why}"));
+        return true;
     }
+    false
 }
 
 /// Why `this` has no host pipeline, as the drop counts name it: a shader

@@ -98,6 +98,11 @@ pub(crate) struct State {
     /// The values sent to each stage for the next device-removed marker.
     #[cfg(feature = "diagnostics")]
     bound_user_data: Vec<BoundUserData>,
+    /// Why the draw or dispatch being prepared is dropped where a missing
+    /// pipeline does not say ("" if it is not), noted by
+    /// [`State::drop_for`].
+    #[cfg(feature = "diagnostics")]
+    dropped_why: &'static str,
 }
 
 impl Drop for State {
@@ -183,10 +188,13 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
+/// Marks the last traced draw as not run on the host, and counts why: its
+/// host pipeline missing, else `why`.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+fn dropped(pipeline: usize, why: &str) {
+    if !crate::pipeline::note_drop(pipeline as This) && !why.is_empty() {
+        crate::pipeline::note_why(why.to_owned());
+    }
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -411,6 +419,10 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -419,6 +431,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            self.drop_for("pipeline made, of another kind");
             return false;
         }
         if !self.bind(list, p, false) {
@@ -456,6 +469,13 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                once!(
+                    address = format_args!("{:#x}", v.address),
+                    size = v.size,
+                    left = ?crate::shadow::find(v.address, 1).map(|s| s.left(v.address)),
+                    "an indexed draw whose index buffer is not in a title buffer dropped"
+                );
+                self.drop_for("pipeline made, index buffer not in a title buffer");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -489,6 +509,10 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
         #[cfg(feature = "diagnostics")]
         let record_bindings = crate::host::dred_on();
         #[cfg(feature = "diagnostics")]
@@ -543,6 +567,7 @@ impl State {
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 TABLE_DROPS.fetch_add(1, Ordering::Relaxed);
+                self.drop_for("pipeline made, no dynamic slots for its tables");
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::warn!(
@@ -605,7 +630,10 @@ impl State {
                                     l.SetGraphicsRootDescriptorTable(param, table);
                                 }
                             },
-                            None => self.table_failed = true,
+                            None => {
+                                self.table_failed = true;
+                                self.drop_for("pipeline made, root SRV without a view heap or slot");
+                            }
                         }
                         continue;
                     }
@@ -613,6 +641,9 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         self.table_failed |= kind == UAV;
+                        if kind == UAV {
+                            self.drop_for("pipeline made, root UAV the title did not set");
+                        }
                         continue;
                     };
                     if kind == UAV {
@@ -693,6 +724,10 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if !self.dropped_why.is_empty() {
+                crate::pipeline::note_why(self.dropped_why.to_owned());
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -754,9 +789,20 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
             #[cfg(feature = "diagnostics")]
             self.note_dropped_writes();
+        }
+    }
+
+    /// Notes why the draw or dispatch being prepared is dropped, for the
+    /// drop counts and [`crate::producers`] (diagnostics builds; the last
+    /// reason noted since preparing began stands).
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables, clippy::unused_self))]
+    fn drop_for(&mut self, why: &'static str) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = why;
         }
     }
 
@@ -767,11 +813,19 @@ impl State {
         if !crate::producers::on() {
             return;
         }
+        let why = match self.dropped_why {
+            "" => crate::pipeline::missing(self.pipeline as This),
+            why => why.to_owned(),
+        };
+        let name = |stage: &str, hash: &str| match why.as_str() {
+            "" => format!("{stage} {hash}"),
+            why => format!("{stage} {hash} ({why})"),
+        };
         let mut writer = String::new();
         for (stage, hash, used) in crate::pipeline::native_used(self.pipeline as This) {
             let compute = stage == "compute";
             if writer.is_empty() || stage == "pixel" || compute {
-                writer = format!("{stage} {hash}");
+                writer = name(stage, hash);
             }
             for u in used
                 .iter()
@@ -782,7 +836,7 @@ impl State {
                 };
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
                 if let Some(view) = crate::descriptor::view(handle) {
-                    crate::producers::dropped_write(&format!("{stage} {hash}"), &view);
+                    crate::producers::dropped_write(&name(stage, hash), &view);
                 }
             }
         }
@@ -803,11 +857,15 @@ impl State {
     /// buffer's end), as for a root SRV, while the view spans the rest of
     /// the buffer; what shaders write past 1 MiB stays in the host copy.
     fn root_uav(&mut self, list: &HostList, address: u64) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
-        let shadow = crate::shadow::find(address, 1)?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            self.drop_for("pipeline made, root UAV not in a title buffer");
+            return None;
+        };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             once!("a root UAV whose host copy shaders cannot write");
+            self.drop_for("pipeline made, root UAV in a copy shaders cannot write");
             return None;
         }
         // Raw views start on 16 bytes; one starting below the address would
@@ -818,11 +876,18 @@ impl State {
         let offset = shadow.offset(address);
         if offset % 16 != 0 {
             once!(offset, "a root UAV not on 16 bytes of its host copy");
+            self.drop_for("pipeline made, root UAV not on 16 bytes of its host copy");
             return None;
         }
-        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
-        let host = heap.host()?;
-        let index = host.dynamic(1)?;
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+            self.drop_for("pipeline made, root UAV with no view heap");
+            return None;
+        };
+        let Some(index) = host.dynamic(1) else {
+            self.drop_for("pipeline made, root UAV without a dynamic slot");
+            return None;
+        };
         self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
         let left = shadow.left(address);
         let elements = u32::try_from(left / 4).unwrap_or(u32::MAX);
@@ -1270,7 +1335,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
             #[cfg(feature = "diagnostics")]
             self.note_dropped_writes();
         }
@@ -1278,7 +1343,7 @@ impl State {
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    fn rectangles(&mut self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -1302,9 +1367,11 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
+                self.drop_for("pipeline made, rectangle vertices outside their buffer");
                 return false;
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                self.drop_for("pipeline made, no scratch memory for rectangles");
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -1344,6 +1411,7 @@ impl State {
         self.trace(|| format!("indexed {indices} from {first}"), false);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
+            self.drop_for("indexed rectangles");
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
@@ -1359,7 +1427,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, self.dropped_why);
             #[cfg(feature = "diagnostics")]
             self.note_dropped_writes();
         }
@@ -1402,6 +1470,10 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.dropped_why = "";
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1419,6 +1491,7 @@ impl State {
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
+            self.drop_for("indirect arguments outside title buffers");
             return false;
         };
         let counter = match count {
@@ -1426,6 +1499,7 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    self.drop_for("indirect count outside title buffers");
                     return false;
                 }
             },
@@ -1436,6 +1510,7 @@ impl State {
             .flatten()
         else {
             why("no host signature");
+            self.drop_for("no host command signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1445,12 +1520,19 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            self.drop_for("indirect arguments not bounded");
             return false;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        // A rectangle list drawn indirectly: its vertex count is in GPU
+        // memory, so it cannot be expanded to triangles as a draw's is.
+        let rects = matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES;
+        if rects {
+            self.drop_for("a rectangle list drawn indirectly");
+        }
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => !rects && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1462,8 +1544,13 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                None => {
+                    crate::pipeline::note_drop(self.pipeline as This);
+                }
+                Some(p) => why(&format!(
+                    "not run (compute {}, mesh {}): {}",
+                    p.compute, p.mesh, self.dropped_why
+                )),
             }
             return false;
         }

@@ -1658,7 +1658,7 @@ impl Meter {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        "dropped {:.1}/frame: {why}",
                         *n as f64 / frames
                     );
                 }
